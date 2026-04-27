@@ -390,10 +390,10 @@ class ModelConfig:
 
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
+            "MiMoV2ProForCausalLM",
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
-            "MiMoV2ProForCausalLM",
         ]
 
     def _detect_attention_sinks(self) -> bool:
