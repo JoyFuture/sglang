@@ -113,6 +113,13 @@ Tried and reverted:
 - Skipping `m_indices` writes in `ep_scatter`. Smoke test passed, but synthetic
   FP8 scatter timing was unchanged: `with_m_indices=0.0389 ms`,
   `without_m_indices=0.0391 ms` for `512 x 6144`, `topk=8`, `all_tokens=4096`.
+- A local 2D contiguous SiLU+mul+FP8 activation-quant candidate for the DeepEP
+  normal path. Synthetic full-path comparison still matched the low-latency
+  equivalent (`max_abs_diff=0.0`, `mean_abs_diff=0.0`), and the isolated kernel
+  was neutral at `M=512` and about `1.31x` faster at `M=4096`. It was not
+  committed or kept after a serving bad-text report; the running service was
+  restored to the known-good 3D `silu_and_mul_masked_post_quant_fwd` wrapper
+  from the correctness fix before further tuning.
 
 ## Benchmarks
 
@@ -160,6 +167,17 @@ Serving smoke after the correctness fix:
   water is `H2O`.
 - Server logs confirmed decode CUDA graph replay during smoke and benchmark
   requests with `cuda graph: True`.
+
+Serving smoke after restoring the known-good activation quant path:
+
+- Short prompt `用一句中文回答：1+1等于几？` returned normal content:
+  `1+1等于2。`.
+- Translation prompt `把下面这句话翻译成英文：今天我们继续优化推理性能。` returned
+  normal content: `Today we continue to optimize inference performance.`
+- A repeated Chinese long-prefill prompt with `2364` prompt tokens returned
+  normal content: `这是一段重复的测试文本。`
+- Server logs confirmed decode CUDA graph replay during the smoke requests with
+  `cuda graph: True`.
 
 ## Current Bottleneck
 
