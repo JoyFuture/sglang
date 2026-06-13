@@ -80,6 +80,18 @@ This captured `Capture cuda graph bs [8, 16, 24, 32]`. Rank-0 available GPU
 memory after CUDA graph capture was about `49.52 GB`, versus about `49.64 GB`
 with only bs=8 captured, so the extra memory cost was small in this setup.
 
+A larger C64 memory-profile run used:
+
+```bash
+--max-total-tokens 49152 \
+--cuda-graph-bs 8 16 32 64 \
+--cuda-graph-max-bs 64
+```
+
+This captured `Capture cuda graph bs [8, 16, 32, 64]` and confirmed decode graph
+replay at C64, but it was slower than the C32 run for this fixed 512-in/64-out
+random-ids benchmark.
+
 ## Implemented Changes
 
 Kept changes:
@@ -175,6 +187,13 @@ All rows use fixed 512 input tokens and 64 output tokens.
 | Larger CUDA graph capture default | 8 | 313.73 | 33.92 | 206.04 | `--cuda-graph-bs 8 16 24 32`; hot C8 rerun |
 | Larger CUDA graph capture default | 16 | 1058.82 | 41.33 | 276.84 | `--num-prompts 16 --max-concurrency 16`; decode graph true |
 | Larger CUDA graph capture default | 32 | 1412.19 | 52.63 | 429.44 | `--num-prompts 32 --max-concurrency 32`; decode graph true |
+| Larger CUDA graph C64 memory run | 64 | 4687.66 | 84.18 | 407.83 | `--max-total-tokens 49152 --cuda-graph-bs 8 16 32 64`; decode graph true |
+
+The C64 benchmark completed `64/64` requests with `32768` input tokens and
+`4096` output tokens in `10.04 s`. Mean end-to-end latency was `9991.00 ms`;
+median/P99 TTFT were `5260.15 ms` and `6926.94 ms`, and median/P99 TPOT were
+`75.13 ms` and `145.49 ms`. This makes C64 a regression versus C32 for the
+current benchmark shape despite fitting in memory.
 
 Correctness-fixed deltas versus the previous DeepEP auto path:
 
@@ -302,6 +321,45 @@ Serving smoke after expanding decode CUDA graph capture to bs 32:
 - Server logs confirmed CUDA graph capture `Capture cuda graph bs [8, 16, 24,
   32]` and decode graph replay at C8/C16/C32 with `cuda graph: True`.
 
+Serving smoke after expanding decode CUDA graph capture to bs 64:
+
+- Short prompt `1+1等于几？只回答数字。` returned normal content: `2`.
+- Server logs confirmed CUDA graph capture `Capture cuda graph bs [8, 16, 32,
+  64]` and decode graph replay at C64 with `cuda graph: True`.
+
+## C64 CUDA Graph Memory Profile
+
+Run config:
+
+```bash
+--mem-fraction-static 0.80 \
+--max-total-tokens 49152 \
+--chunked-prefill-size 2048 \
+--context-length 8192 \
+--cuda-graph-bs 8 16 32 64 \
+--cuda-graph-max-bs 64
+```
+
+Memory sources were the SGLang startup log and a 1-second `nvidia-smi` sampler.
+SGLang reports decimal `GB`; `nvidia-smi` reports `MiB`.
+
+| Stage | Per-GPU memory | Remaining memory | Notes |
+|---|---:|---:|---|
+| Empty GPU baseline | `0 MiB` used by `nvidia-smi` | `143167 MiB` free | `143771 MiB` total reported by `nvidia-smi` |
+| After weight load | `77.19 GB` load delta | `60.75-60.98 GB` available | Model resident memory after fp8/MXFP4 load |
+| KV/SWA cache pool | `1.70 GB` reported pool | `58.80-59.03 GB` available after memory pool | SWA cache `39321` tokens plus full cache `49152` tokens |
+| KV/SWA cache components | `0.84 + 0.56 + 0.18 + 0.12 GB` | Included above | K/V for SWA cache plus K/V for full cache |
+| CUDA graph capture | `9.01-10.19 GB` capture delta | `48.52-49.92 GB` available after capture | Rank 0 was `9.95 GB` delta and `48.80 GB` available |
+| Idle after C64 benchmark | `92944-94612 MiB` used | `48556-50224 MiB` free | Last sampled `nvidia-smi` values after the benchmark |
+| Peak sampled use | `93262-94702 MiB` used | `48466-49906 MiB` free | Peak over the full 285.9-second sampling window |
+
+During the C64 benchmark window, the 1-second sampler saw per-GPU memory rise by
+`408-866 MiB` from the first in-window sample to the peak in-window sample. This
+is a rough activation/temp-buffer estimate of about `0.4-0.9 GiB` per GPU, but
+it can miss sub-second peaks. Decode logs reached about `0.79` full-token usage
+and `0.93` SWA-token usage, so the C64 run was close to the configured SWA pool
+capacity with `--max-total-tokens 49152`.
+
 ## Current Bottleneck
 
 The current Hopper dot_scaled path keeps the checkpoint layout and avoids manual
@@ -317,4 +375,6 @@ additional GPU memory. The next large performance step is likely one of:
   accuracy and layout semantics are acceptable;
 - a deeper DeepEP low-latency path that reduces TTFT under higher concurrency.
   Expanding CUDA graph capture to bs 32 improves graph coverage and throughput
-  at C16/C32, but TTFT grows with concurrent prefill and decode pressure.
+  at C16/C32, but TTFT grows with concurrent prefill and decode pressure. The
+  C64 memory-profile run fit, but it did not improve throughput and had much
+  worse TTFT/TPOT than C32 for the current benchmark shape.
