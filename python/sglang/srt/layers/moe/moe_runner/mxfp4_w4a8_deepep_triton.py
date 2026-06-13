@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+
+_USE_DOT_SCALED = os.environ.get("SGLANG_MXFP4_W4A8_DOT_SCALED", "1") != "0"
+_DOT_SCALED_K = 32
 
 
 @triton.jit
@@ -151,6 +156,111 @@ def _mxfp4_w4a8_grouped_gemm_kernel(
     )
 
 
+@triton.jit
+def _mxfp4_w4a8_grouped_gemm_dot_scaled_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_packed_ptr,
+    b_scale_ptr,
+    c_ptr,
+    masked_m_ptr,
+    stride_ae: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_ase: tl.constexpr,
+    stride_asm: tl.constexpr,
+    stride_asg: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bk2: tl.constexpr,
+    stride_bse: tl.constexpr,
+    stride_bsn: tl.constexpr,
+    stride_bsg: tl.constexpr,
+    stride_ce: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    A_SCALE_GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_K: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    m_block = tl.program_id(1)
+    n_block = tl.program_id(2)
+
+    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_count = tl.load(masked_m_ptr + expert_id)
+    if token_count <= m_block * BLOCK_M:
+        if M <= 8:
+            tl.store(
+                c_ptr
+                + expert_id * stride_ce
+                + offs_m[:, None] * stride_cm
+                + offs_n[None, :] * stride_cn,
+                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32).to(tl.bfloat16),
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            )
+        return
+
+    valid_m = offs_m < token_count
+    valid_n = offs_n < N
+    offs_k = tl.arange(0, DOT_K)
+    offs_k2 = tl.arange(0, DOT_K // 2)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, DOT_K):
+        a_raw = tl.load(
+            a_ptr
+            + expert_id * stride_ae
+            + offs_m[:, None] * stride_am
+            + (k_start + offs_k[None, :]) * stride_ak,
+            mask=valid_m[:, None] & ((k_start + offs_k[None, :]) < K),
+            other=0.0,
+        )
+        b_raw = tl.load(
+            b_packed_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + (k_start // 2 + offs_k2[:, None]) * stride_bk2,
+            mask=valid_n[None, :] & ((k_start // 2 + offs_k2[:, None]) < K // 2),
+            other=0,
+        ).to(tl.uint8)
+
+        raw_acc = tl.dot_scaled(a_raw, None, "e4m3", b_raw, None, "e2m1")
+        a_scale = tl.load(
+            a_scale_ptr
+            + expert_id * stride_ase
+            + offs_m * stride_asm
+            + (k_start // A_SCALE_GROUP_SIZE) * stride_asg,
+            mask=valid_m,
+            other=1.0,
+        ).to(tl.float32)
+        b_scale = tl.load(
+            b_scale_ptr
+            + expert_id * stride_bse
+            + offs_n * stride_bsn
+            + (k_start // DOT_K) * stride_bsg,
+            mask=valid_n,
+            other=1.0,
+        ).to(tl.float32)
+        acc += raw_acc * a_scale[:, None] * b_scale[None, :]
+
+    c = acc.to(tl.bfloat16)
+    tl.store(
+        c_ptr
+        + expert_id * stride_ce
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        tl.where(valid_m[:, None] & valid_n[None, :], c, 0.0),
+        mask=(offs_m[:, None] < M) & valid_n[None, :],
+    )
+
+
 def _check_inputs(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -243,7 +353,7 @@ def _launch_grouped_gemm(
         triton.cdiv(grid_m, block_m),
         triton.cdiv(n, block_n),
     )
-    _mxfp4_w4a8_grouped_gemm_kernel[grid](
+    launch_args = (
         a,
         a_scale,
         b_packed.view(torch.uint8),
@@ -269,12 +379,26 @@ def _launch_grouped_gemm(
         n,
         k,
         a_scale_group_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=4,
-        num_stages=3,
     )
+    if _USE_DOT_SCALED:
+        _mxfp4_w4a8_grouped_gemm_dot_scaled_kernel[grid](
+            *launch_args,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            DOT_K=_DOT_SCALED_K,
+            num_warps=4,
+            num_stages=3,
+        )
+    else:
+        _mxfp4_w4a8_grouped_gemm_kernel[grid](
+            *launch_args,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=4,
+            num_stages=3,
+        )
     return output
 
 
@@ -387,6 +511,95 @@ def _mxfp4_w4a8_grouped_gemm_contig_kernel(
     )
 
 
+@triton.jit
+def _mxfp4_w4a8_grouped_gemm_contig_dot_scaled_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_packed_ptr,
+    b_scale_ptr,
+    c_ptr,
+    expert_start_ptr,
+    num_tokens_per_expert_ptr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_asm: tl.constexpr,
+    stride_asg: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bk2: tl.constexpr,
+    stride_bse: tl.constexpr,
+    stride_bsn: tl.constexpr,
+    stride_bsg: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    A_SCALE_GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_K: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    m_block = tl.program_id(1)
+    n_block = tl.program_id(2)
+
+    expert_start = tl.load(expert_start_ptr + expert_id).to(tl.int64)
+    token_count = tl.load(num_tokens_per_expert_ptr + expert_id)
+    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    if token_count <= m_block * BLOCK_M:
+        return
+
+    global_m = expert_start + offs_m
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    valid_m = offs_m < token_count
+    valid_n = offs_n < N
+    offs_k = tl.arange(0, DOT_K)
+    offs_k2 = tl.arange(0, DOT_K // 2)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, DOT_K):
+        a_raw = tl.load(
+            a_ptr
+            + global_m[:, None] * stride_am
+            + (k_start + offs_k[None, :]) * stride_ak,
+            mask=valid_m[:, None] & ((k_start + offs_k[None, :]) < K),
+            other=0.0,
+        )
+        b_raw = tl.load(
+            b_packed_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + (k_start // 2 + offs_k2[:, None]) * stride_bk2,
+            mask=valid_n[None, :] & ((k_start // 2 + offs_k2[:, None]) < K // 2),
+            other=0,
+        ).to(tl.uint8)
+
+        raw_acc = tl.dot_scaled(a_raw, None, "e4m3", b_raw, None, "e2m1")
+        a_scale = tl.load(
+            a_scale_ptr
+            + global_m * stride_asm
+            + (k_start // A_SCALE_GROUP_SIZE) * stride_asg,
+            mask=valid_m,
+            other=1.0,
+        ).to(tl.float32)
+        b_scale = tl.load(
+            b_scale_ptr
+            + expert_id * stride_bse
+            + offs_n * stride_bsn
+            + (k_start // DOT_K) * stride_bsg,
+            mask=valid_n,
+            other=1.0,
+        ).to(tl.float32)
+        acc += raw_acc * a_scale[:, None] * b_scale[None, :]
+
+    tl.store(
+        c_ptr + global_m[:, None] * stride_cm + offs_n[None, :] * stride_cn,
+        tl.where(valid_m[:, None] & valid_n[None, :], acc.to(tl.bfloat16), 0.0),
+        mask=valid_m[:, None] & valid_n[None, :],
+    )
+
+
 def _launch_grouped_gemm_contig(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -438,7 +651,7 @@ def _launch_grouped_gemm_contig(
         triton.cdiv(max_m, block_m),
         triton.cdiv(n, block_n),
     )
-    _mxfp4_w4a8_grouped_gemm_contig_kernel[grid](
+    launch_args = (
         a,
         a_scale,
         b_packed.view(torch.uint8),
@@ -461,12 +674,26 @@ def _launch_grouped_gemm_contig(
         n,
         k,
         a_scale_group_size,
-        BLOCK_M=block_m,
-        BLOCK_N=block_n,
-        BLOCK_K=block_k,
-        num_warps=4,
-        num_stages=3,
     )
+    if _USE_DOT_SCALED:
+        _mxfp4_w4a8_grouped_gemm_contig_dot_scaled_kernel[grid](
+            *launch_args,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            DOT_K=_DOT_SCALED_K,
+            num_warps=4,
+            num_stages=3,
+        )
+    else:
+        _mxfp4_w4a8_grouped_gemm_contig_kernel[grid](
+            *launch_args,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            num_warps=4,
+            num_stages=3,
+        )
     return output
 
 
