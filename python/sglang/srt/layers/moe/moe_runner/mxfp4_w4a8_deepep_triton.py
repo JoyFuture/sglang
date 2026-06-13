@@ -59,6 +59,15 @@ def _mxfp4_w4a8_grouped_gemm_kernel(
     offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
     token_count = tl.load(masked_m_ptr + expert_id)
     if token_count <= m_block * BLOCK_M:
+        if M <= 8:
+            tl.store(
+                c_ptr
+                + expert_id * stride_ce
+                + offs_m[:, None] * stride_cm
+                + offs_n[None, :] * stride_cn,
+                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32).to(tl.bfloat16),
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            )
         return
 
     valid_m = offs_m < token_count
@@ -206,10 +215,24 @@ def _launch_grouped_gemm(
             f"{tuple(a_scale.shape)=}"
         )
 
+    if m <= 8:
+        block_n = 128
+        block_k = 128 if k >= n else 64
+        if m <= 1:
+            block_m = 2 if k >= n else 4
+        elif m <= 4:
+            block_m = 4
+        else:
+            block_m = 8
+    else:
+        block_m = 16
+        block_n = 64
+        block_k = 64
+
     grid = (
         e,
-        triton.cdiv(m, 16),
-        triton.cdiv(n, 64),
+        triton.cdiv(m, block_m),
+        triton.cdiv(n, block_n),
     )
     _mxfp4_w4a8_grouped_gemm_kernel[grid](
         a,
@@ -237,9 +260,9 @@ def _launch_grouped_gemm(
         n,
         k,
         a_scale_group_size,
-        BLOCK_M=16,
-        BLOCK_N=64,
-        BLOCK_K=64,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
         num_warps=4,
         num_stages=3,
     )

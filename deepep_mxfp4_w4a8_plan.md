@@ -779,3 +779,57 @@ python3 -m sglang.launch_server \
 - 只处理 FP32 activation/weight scale layout；其他 scale layout 仍走 reference fallback；
 - 尚未做 decode batch、TP8、DeepEP combine overlap 场景下的完整 benchmark 和稳定性验证。
 - 尚未实现最终 CUTLASS/SM90 级 Hopper kernel 和完整 benchmark。
+
+## 15. 2026-06-13 decode 小 batch Triton tile 优化
+
+本轮目标是继续压低 graph-safe Triton prototype 的 decode 路径耗时。
+
+先尝试过为 `m <= 8` 增加 grouped GEMV kernel，但 synthetic decode 形状上是回退：
+
+- 形状：`E=48, M=2, H=6144, I=2048, active routed slots=64`；
+- 原 grouped GEMM full：约 `4.31 ms`；
+- GEMV full：约 `5.88 ms`；
+- 原因是 token 维拆开后 CTA 数增加，收益抵不过额外调度、return/store 和 reduction 开销。
+
+最终采用的优化是继续使用同一个 grouped GEMM kernel，只对 decode 小 batch 调整 tile：
+
+```text
+if M <= 8:
+  BLOCK_N = 128
+  BLOCK_K = 128 when K >= N else 64
+  BLOCK_M = 2/4/8 based on M and K/N shape
+else:
+  保持原 BLOCK_M=16, BLOCK_N=64, BLOCK_K=64
+```
+
+同时对 `M <= 8` 的全无效 block 写零，避免 empty expert / padded token 的 `torch.empty` 残留 NaN 进入输出张量。大 batch 路径保持原 early return 行为，避免扩大额外写零开销。
+
+decode 近似形状性能结果：
+
+```text
+E=48, M=2, H=6144, I=2048, active routed slots=64
+
+full:  4.306 ms -> 3.607 ms
+GEMM1: 2.853 ms -> 2.360 ms
+act:   ~0.019 ms
+GEMM2: 1.437 ms -> 1.231 ms
+```
+
+小 batch sweep：
+
+```text
+M=1: 6.322 ms -> 5.319 ms, 1.19x
+M=2: 4.307 ms -> 3.607 ms, 1.19x
+M=4: 2.259 ms -> 1.855 ms, 1.22x
+M=8: 1.243 ms -> 1.008 ms, 1.23x
+```
+
+验证：
+
+- 非 contiguous `hidden_states_scale` + empty expert case 输出 finite；
+- valid token 与 PyTorch reference 最大误差约 `2.7e-7`；
+- invalid / padded slot 最大绝对值为 `0.0`；
+- `torch.cuda.CUDAGraph` capture/replay 在 same input 和 changed input 下均通过；
+- `py_compile`、`black --check`、`git diff --check` 均通过。
+
+注意：这仍然只是 Triton prototype 的 decode 小 batch 优化，不是最终 Hopper/SM90 级 MXFP4/W4A8 kernel。最终性能目标仍需要 CUTLASS / custom CUDA kernel，特别是把在线 MXFP4 decode、scale 应用和 W4A8 MMA 路径做成更接近硬件峰值的实现。
