@@ -69,6 +69,17 @@ Runtime note: with this model and `tp-size=8`, CUDA graph capture logs
 gather constraint, so decode graph replay pads smaller concurrency to the bs=8
 graph. Decode logs confirm `cuda graph: True`.
 
+Larger decode graph coverage was also tested by replacing the graph flags with:
+
+```bash
+--cuda-graph-bs 8 16 24 32 \
+--cuda-graph-max-bs 32
+```
+
+This captured `Capture cuda graph bs [8, 16, 24, 32]`. Rank-0 available GPU
+memory after CUDA graph capture was about `49.52 GB`, versus about `49.64 GB`
+with only bs=8 captured, so the extra memory cost was small in this setup.
+
 ## Implemented Changes
 
 Kept changes:
@@ -161,6 +172,9 @@ All rows use fixed 512 input tokens and 64 output tokens.
 | Experimental e8m0 low-latency scale path | 8 | 320.79 | 39.68 | 179.02 | Hot rerun; first C8 run was `335.35 ms / 39.71 ms / 178.01 tok/s` |
 | Current default after e8m0 default-off | 1 | 280.30 | 28.28 | 30.98 | `SGLANG_MXFP4_W4A8_E8M0_LL` unset; decode CUDA graph enabled |
 | Current default after e8m0 default-off | 8 | 328.04 | 34.08 | 204.10 | `SGLANG_MXFP4_W4A8_E8M0_LL` unset; decode CUDA graph enabled |
+| Larger CUDA graph capture default | 8 | 313.73 | 33.92 | 206.04 | `--cuda-graph-bs 8 16 24 32`; hot C8 rerun |
+| Larger CUDA graph capture default | 16 | 1058.82 | 41.33 | 276.84 | `--num-prompts 16 --max-concurrency 16`; decode graph true |
+| Larger CUDA graph capture default | 32 | 1412.19 | 52.63 | 429.44 | `--num-prompts 32 --max-concurrency 32`; decode graph true |
 
 Correctness-fixed deltas versus the previous DeepEP auto path:
 
@@ -280,6 +294,14 @@ Serving smoke after the e8m0 experiment was made default-off:
 - Server logs confirmed CUDA graph capture `Capture cuda graph bs [8]` and
   decode graph replay with `cuda graph: True`.
 
+Serving smoke after expanding decode CUDA graph capture to bs 32:
+
+- Short prompt `1+1等于几？只回答数字。` returned normal content: `2`.
+- Translation prompt `Translate to English: 今天我们继续优化推理性能。` returned
+  normal content: `Today we continue to optimize inference performance.`
+- Server logs confirmed CUDA graph capture `Capture cuda graph bs [8, 16, 24,
+  32]` and decode graph replay at C8/C16/C32 with `cuda graph: True`.
+
 ## Current Bottleneck
 
 The current Hopper dot_scaled path keeps the checkpoint layout and avoids manual
@@ -293,5 +315,6 @@ additional GPU memory. The next large performance step is likely one of:
   by `tl.dot_scaled` or a CUTLASS/DeepGEMM-style kernel;
 - a load-time weight conversion into an existing W4A8-compatible layout, if the
   accuracy and layout semantics are acceptable;
-- a deeper DeepEP low-latency path that can avoid padding smaller decode batches
-  to the bs=8 CUDA graph work shape under `tp-size=8`.
+- a deeper DeepEP low-latency path that reduces TTFT under higher concurrency.
+  Expanding CUDA graph capture to bs 32 improves graph coverage and throughput
+  at C16/C32, but TTFT grows with concurrent prefill and decode pressure.
