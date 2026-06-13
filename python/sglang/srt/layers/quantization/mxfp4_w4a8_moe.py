@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -14,6 +15,21 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 logger = logging.getLogger(__name__)
+
+
+def _mxfp4_scale_to_e8m0(scale: torch.Tensor) -> torch.Tensor | None:
+    if os.environ.get("SGLANG_MXFP4_W4A8_E8M0_LL", "0") == "0":
+        return None
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is None:
+        return None
+    if scale.dtype == e8m0_dtype:
+        return scale.contiguous().view(torch.uint8)
+    if scale.dtype == torch.uint8:
+        return scale.contiguous()
+    if scale.dtype == torch.int8:
+        return scale.contiguous().view(torch.uint8)
+    return scale.to(e8m0_dtype).view(torch.uint8).contiguous()
 
 
 class Mxfp4W4A8MoEMethod:
@@ -64,6 +80,16 @@ class Mxfp4W4A8MoEMethod:
 
         layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
         layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+        layer.register_buffer(
+            "w13_weight_scale_e8m0",
+            _mxfp4_scale_to_e8m0(layer.w13_weight_scale_inv.data),
+            persistent=False,
+        )
+        layer.register_buffer(
+            "w2_weight_scale_e8m0",
+            _mxfp4_scale_to_e8m0(layer.w2_weight_scale_inv.data),
+            persistent=False,
+        )
         layer._dsv4_mxfp4_backend = "mxfp4_w4a8"
         log_info_on_rank0(
             logger,
@@ -84,6 +110,8 @@ class Mxfp4W4A8MoEMethod:
             w2_weight=layer.w2_weight,
             w13_weight_scale=layer.w13_weight_scale_inv,
             w2_weight_scale=layer.w2_weight_scale_inv,
+            w13_weight_scale_e8m0=layer.w13_weight_scale_e8m0,
+            w2_weight_scale_e8m0=layer.w2_weight_scale_e8m0,
             swiglu_limit=self.moe_runner_config.swiglu_limit,
         )
         return self.runner.run(dispatch_output, quant_info=quant_info)

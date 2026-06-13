@@ -27,6 +27,8 @@ class Mxfp4W4A8QuantInfo(MoeQuantInfo):
     w2_weight: torch.Tensor
     w13_weight_scale: torch.Tensor
     w2_weight_scale: torch.Tensor
+    w13_weight_scale_e8m0: Optional[torch.Tensor] = None
+    w2_weight_scale_e8m0: Optional[torch.Tensor] = None
     swiglu_limit: Optional[float] = None
 
 
@@ -337,9 +339,7 @@ def fused_experts_deepep_to_mxfp4_w4a8(
     runner_config: MoeRunnerConfig,
 ) -> DeepEPLLCombineInput | DeepEPNormalCombineInput:
     if not DispatchOutputChecker.format_is_deepep(dispatch_output):
-        raise NotImplementedError(
-            "mxfp4_w4a8 currently supports DeepEP dispatch only."
-        )
+        raise NotImplementedError("mxfp4_w4a8 currently supports DeepEP dispatch only.")
     _validate_runner_config(runner_config)
     if not isinstance(quant_info, Mxfp4W4A8QuantInfo):
         raise TypeError(f"Unexpected quant_info type: {type(quant_info)}")
@@ -369,6 +369,8 @@ def fused_experts_deepep_to_mxfp4_w4a8(
             quant_info.w2_weight,
             quant_info.w13_weight_scale,
             quant_info.w2_weight_scale,
+            quant_info.w13_weight_scale_e8m0,
+            quant_info.w2_weight_scale_e8m0,
         )
     else:
         output = _mxfp4_w4a8_deepep_ll_reference(

@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
 
 _USE_DOT_SCALED = os.environ.get("SGLANG_MXFP4_W4A8_DOT_SCALED", "1") != "0"
+_USE_E8M0_WEIGHT_SCALE_LL = os.environ.get("SGLANG_MXFP4_W4A8_E8M0_LL", "0") != "0"
 _DOT_SCALED_K = 32
 
 
@@ -261,6 +262,111 @@ def _mxfp4_w4a8_grouped_gemm_dot_scaled_kernel(
     )
 
 
+@triton.jit
+def _mxfp4_w4a8_grouped_gemm_dot_scaled_e8m0_kernel(
+    a_ptr,
+    a_scale_ptr,
+    b_packed_ptr,
+    b_scale_e8m0_ptr,
+    c_ptr,
+    masked_m_ptr,
+    stride_ae: tl.constexpr,
+    stride_am: tl.constexpr,
+    stride_ak: tl.constexpr,
+    stride_ase: tl.constexpr,
+    stride_asm: tl.constexpr,
+    stride_asg: tl.constexpr,
+    stride_be: tl.constexpr,
+    stride_bn: tl.constexpr,
+    stride_bk2: tl.constexpr,
+    stride_bse: tl.constexpr,
+    stride_bsn: tl.constexpr,
+    stride_bsg: tl.constexpr,
+    stride_ce: tl.constexpr,
+    stride_cm: tl.constexpr,
+    stride_cn: tl.constexpr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    K: tl.constexpr,
+    A_SCALE_GROUP_SIZE: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    DOT_K: tl.constexpr,
+):
+    expert_id = tl.program_id(0)
+    m_block = tl.program_id(1)
+    n_block = tl.program_id(2)
+
+    offs_m = m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = n_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_count = tl.load(masked_m_ptr + expert_id)
+    if token_count <= m_block * BLOCK_M:
+        if M <= 8:
+            tl.store(
+                c_ptr
+                + expert_id * stride_ce
+                + offs_m[:, None] * stride_cm
+                + offs_n[None, :] * stride_cn,
+                tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32).to(tl.bfloat16),
+                mask=(offs_m[:, None] < M) & (offs_n[None, :] < N),
+            )
+        return
+
+    valid_m = offs_m < token_count
+    valid_n = offs_n < N
+    offs_k = tl.arange(0, DOT_K)
+    offs_k2 = tl.arange(0, DOT_K // 2)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    for k_start in range(0, K, DOT_K):
+        a_raw = tl.load(
+            a_ptr
+            + expert_id * stride_ae
+            + offs_m[:, None] * stride_am
+            + (k_start + offs_k[None, :]) * stride_ak,
+            mask=valid_m[:, None] & ((k_start + offs_k[None, :]) < K),
+            other=0.0,
+        )
+        b_raw = tl.load(
+            b_packed_ptr
+            + expert_id * stride_be
+            + offs_n[None, :] * stride_bn
+            + (k_start // 2 + offs_k2[:, None]) * stride_bk2,
+            mask=valid_n[None, :] & ((k_start // 2 + offs_k2[:, None]) < K // 2),
+            other=0,
+        ).to(tl.uint8)
+        b_scale = tl.load(
+            b_scale_e8m0_ptr
+            + expert_id * stride_bse
+            + offs_n[:, None] * stride_bsn
+            + (k_start // DOT_K) * stride_bsg,
+            mask=valid_n[:, None],
+            other=127,
+        ).to(tl.uint8)
+
+        raw_acc = tl.dot_scaled(a_raw, None, "e4m3", b_raw, b_scale, "e2m1")
+        a_scale = tl.load(
+            a_scale_ptr
+            + expert_id * stride_ase
+            + offs_m * stride_asm
+            + (k_start // A_SCALE_GROUP_SIZE) * stride_asg,
+            mask=valid_m,
+            other=1.0,
+        ).to(tl.float32)
+        acc += raw_acc * a_scale[:, None]
+
+    c = acc.to(tl.bfloat16)
+    tl.store(
+        c_ptr
+        + expert_id * stride_ce
+        + offs_m[:, None] * stride_cm
+        + offs_n[None, :] * stride_cn,
+        tl.where(valid_m[:, None] & valid_n[None, :], c, 0.0),
+        mask=(offs_m[:, None] < M) & valid_n[None, :],
+    )
+
+
 def _check_inputs(
     hidden_states: torch.Tensor,
     hidden_states_scale: torch.Tensor,
@@ -312,6 +418,7 @@ def _launch_grouped_gemm(
     n: int,
     k: int,
     num_routed_tokens: int | None = None,
+    b_scale_e8m0: torch.Tensor | None = None,
 ) -> torch.Tensor:
     e, m, _ = a.shape
     if a_scale.shape[:2] != (e, m):
@@ -380,7 +487,41 @@ def _launch_grouped_gemm(
         k,
         a_scale_group_size,
     )
-    if _USE_DOT_SCALED:
+    if _USE_DOT_SCALED and _USE_E8M0_WEIGHT_SCALE_LL and b_scale_e8m0 is not None:
+        _mxfp4_w4a8_grouped_gemm_dot_scaled_e8m0_kernel[grid](
+            a,
+            a_scale,
+            b_packed.view(torch.uint8),
+            b_scale_e8m0,
+            output,
+            masked_m,
+            a.stride(0),
+            a.stride(1),
+            a.stride(2),
+            a_scale.stride(0),
+            a_scale.stride(1),
+            a_scale.stride(2),
+            b_packed.stride(0),
+            b_packed.stride(1),
+            b_packed.stride(2),
+            b_scale_e8m0.stride(0),
+            b_scale_e8m0.stride(1),
+            b_scale_e8m0.stride(2),
+            output.stride(0),
+            output.stride(1),
+            output.stride(2),
+            m,
+            n,
+            k,
+            a_scale_group_size,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_K=block_k,
+            DOT_K=_DOT_SCALED_K,
+            num_warps=4,
+            num_stages=3,
+        )
+    elif _USE_DOT_SCALED:
         _mxfp4_w4a8_grouped_gemm_dot_scaled_kernel[grid](
             *launch_args,
             BLOCK_M=block_m,
@@ -706,6 +847,8 @@ def mxfp4_w4a8_deepep_ll_triton(
     w2_weight: torch.Tensor,
     w13_weight_scale: torch.Tensor,
     w2_weight_scale: torch.Tensor,
+    w13_weight_scale_e8m0: torch.Tensor | None = None,
+    w2_weight_scale_e8m0: torch.Tensor | None = None,
 ) -> torch.Tensor:
     _check_inputs(
         hidden_states,
@@ -753,6 +896,7 @@ def mxfp4_w4a8_deepep_ll_triton(
         n=gateup_size,
         k=hidden_size,
         num_routed_tokens=num_routed_tokens,
+        b_scale_e8m0=w13_weight_scale_e8m0,
     )
 
     down_input = torch.empty(
@@ -782,6 +926,7 @@ def mxfp4_w4a8_deepep_ll_triton(
         n=hidden_size,
         k=intermediate_size,
         num_routed_tokens=num_routed_tokens,
+        b_scale_e8m0=w2_weight_scale_e8m0,
     )
 
 

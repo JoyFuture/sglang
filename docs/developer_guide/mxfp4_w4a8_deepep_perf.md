@@ -97,6 +97,10 @@ Kept changes:
   weight scales outside the dot. This is enabled by default and can be disabled
   with `SGLANG_MXFP4_W4A8_DOT_SCALED=0` to fall back to the previous hand-decoded
   E2M1 Triton kernel.
+- Added an experimental low-latency decode path that converts MXFP4 weight
+  scales to e8m0/uint8 at load time and passes them directly to `tl.dot_scaled`.
+  It is disabled by default after end-to-end serving benchmarks regressed. Set
+  `SGLANG_MXFP4_W4A8_E8M0_LL=1` to enable it for targeted experiments.
 
 Correctness note:
 
@@ -130,6 +134,12 @@ Tried and reverted:
   failed in the SM90 MLIR lowering pipeline for that shape, so the kept kernel
   leaves `tl.dot_scaled` scales as `None` and applies float32 scales to each
   32-wide K tile after the raw dot.
+- Enabling e8m0 MXFP4 weight scales directly in the low-latency decode
+  `tl.dot_scaled` kernels. Synthetic low-latency GEMM timings improved, but
+  serving TPOT regressed and the extra scale buffers reduced available rank-0
+  GPU memory after CUDA graph capture from about `49.64 GB` to about `46.01 GB`.
+  The code remains behind `SGLANG_MXFP4_W4A8_E8M0_LL=1`, but the default path
+  does not allocate those buffers and keeps the external float-scale kernel.
 
 ## Benchmarks
 
@@ -147,6 +157,10 @@ All rows use fixed 512 input tokens and 64 output tokens.
 | Correctness-fixed MXFP4 W4A8 DeepEP auto | 8 | 695.21 | 107.75 | 67.46 | Warm-server run after normal-path activation quantization fix |
 | Hopper dot_scaled MXFP4 W4A8 DeepEP auto | 1 | 280.19 | 28.33 | 30.93 | Warm-server run with decode CUDA graph enabled |
 | Hopper dot_scaled MXFP4 W4A8 DeepEP auto | 8 | 318.81 | 34.12 | 204.61 | Warm-server run with decode CUDA graph enabled |
+| Experimental e8m0 low-latency scale path | 1 | 284.93 | 31.92 | 27.82 | `SGLANG_MXFP4_W4A8_E8M0_LL=1`; warm-server run |
+| Experimental e8m0 low-latency scale path | 8 | 320.79 | 39.68 | 179.02 | Hot rerun; first C8 run was `335.35 ms / 39.71 ms / 178.01 tok/s` |
+| Current default after e8m0 default-off | 1 | 280.30 | 28.28 | 30.98 | `SGLANG_MXFP4_W4A8_E8M0_LL` unset; decode CUDA graph enabled |
+| Current default after e8m0 default-off | 8 | 328.04 | 34.08 | 204.10 | `SGLANG_MXFP4_W4A8_E8M0_LL` unset; decode CUDA graph enabled |
 
 Correctness-fixed deltas versus the previous DeepEP auto path:
 
@@ -193,6 +207,21 @@ Kernel microbenchmarks for the dot_scaled path:
 | Normal GEMM1, `N=32768,K=6144`, 4096 routed tokens | 98.1322 | 11.7592 | 8.35x | 0.1499 | 188.5663 |
 | Normal GEMM2, `N=6144,K=16384`, 4096 routed tokens | 57.0733 | 6.8607 | 8.32x | 0.2511 | 308.2648 |
 
+Synthetic low-latency e8m0 scale microbenchmarks against the current external
+float-scale dot_scaled kernel:
+
+| Kernel Shape | External Float Scale (ms) | e8m0 Scale (ms) | Speedup | Max Diff | Mean Diff | Mean Abs Ref |
+|---|---:|---:|---:|---:|---:|---:|
+| Low-latency GEMM1, `N=32768,K=6144`, 16 routed tokens | 1.0475 | 0.7609 | 1.38x | 32.0 | 0.000263 | 2011.4004 |
+| Low-latency GEMM2, `N=6144,K=16384`, 16 routed tokens | 1.0566 | 0.8596 | 1.23x | 32.0 | 0.000791 | 3307.1658 |
+| Normal GEMM1, `N=32768,K=6144`, 4096 routed tokens | 11.7406 | 12.7812 | 0.92x | 64.0 | 0.000191 | 2010.3130 |
+| Normal GEMM2, `N=6144,K=16384`, 4096 routed tokens | 6.8358 | 7.3526 | 0.93x | 64.0 | 0.000449 | 3295.7183 |
+
+A smaller direct-launch smoke with exactly e8m0-derived random scales also showed
+low-latency kernel wins (`1.16x` for GEMM1 and `1.47x` for GEMM2, max diff
+`0.5`), but the end-to-end serving regression above makes this path unsuitable
+as the default.
+
 Synthetic full-path comparison against the previous hand-decoded Triton path:
 
 - Low-latency path, small `H=128,I=256` shape: active-row
@@ -236,13 +265,29 @@ Serving smoke after enabling the Hopper dot_scaled kernel:
   decode graph replay during smoke and benchmark requests with
   `cuda graph: True`.
 
+Serving smoke after the e8m0 experiment was made default-off:
+
+- Short prompt `1+1等于几？只回答数字。` returned normal content: `2`.
+- Translation prompt `Translate to English: 今天我们继续优化推理性能。` returned
+  normal content: `Today we continue to optimize inference performance.`
+- A repeated Chinese long-prefill prompt with `1820` prompt tokens returned
+  normal content: `这段文本是用于测试推理服务的重复性填充文本。`
+- A prior `max_tokens=96` long-prefill smoke returned empty `content` with
+  `finish_reason=length` because all generated tokens were used by
+  `reasoning_content`. Increasing `max_tokens` to `240` returned normal content,
+  so this symptom is request-budget related rather than a kernel bad-text
+  regression.
+- Server logs confirmed CUDA graph capture `Capture cuda graph bs [8]` and
+  decode graph replay with `cuda graph: True`.
+
 ## Current Bottleneck
 
 The current Hopper dot_scaled path keeps the checkpoint layout and avoids manual
 E2M1 nibble decode in the GEMM loop. It still applies float32 activation and
-weight scales outside `tl.dot_scaled` because the checkpoint and DeepEP
-activation scales are not in the e8m0 layout expected by the dot-scaled op. The
-next large performance step is likely one of:
+weight scales outside `tl.dot_scaled` by default. A direct e8m0 weight-scale
+variant exists for low-latency decode experiments, but it is default-off because
+end-to-end serving regressed and the load-time buffers consumed several GB of
+additional GPU memory. The next large performance step is likely one of:
 
 - load-time conversion of MXFP4 scales to a layout that can be consumed directly
   by `tl.dot_scaled` or a CUTLASS/DeepGEMM-style kernel;
