@@ -16,6 +16,8 @@ from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 from sglang.srt.layers.moe.token_dispatcher.deepep import (
     DeepEPLLCombineInput,
     DeepEPLLDispatchOutput,
+    DeepEPNormalCombineInput,
+    DeepEPNormalDispatchOutput,
 )
 
 
@@ -168,25 +170,182 @@ def _can_use_triton_path(
     return True
 
 
-@register_fused_func("deepep", "mxfp4_w4a8")
-def fused_experts_deepep_to_mxfp4_w4a8(
-    dispatch_output: DeepEPLLDispatchOutput,
-    quant_info: MoeQuantInfo,
-    runner_config: MoeRunnerConfig,
-) -> DeepEPLLCombineInput:
-    if not DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
-        raise NotImplementedError(
-            "mxfp4_w4a8 currently supports DeepEP low_latency dispatch only. "
-            "Start the server with --deepep-mode low_latency."
-        )
+def _validate_runner_config(runner_config: MoeRunnerConfig) -> None:
     if runner_config.activation != "silu":
         raise NotImplementedError("mxfp4_w4a8 currently supports silu MoE only.")
     if runner_config.apply_router_weight_on_input:
         raise NotImplementedError(
             "mxfp4_w4a8 does not support apply_router_weight_on_input."
         )
+
+
+def _deepep_normal_num_tokens_to_gpu(
+    num_recv_tokens_per_expert: list[int],
+    device: torch.device,
+) -> torch.Tensor:
+    from sglang.srt.layers.moe.moe_runner.deep_gemm import copy_list_to_gpu_no_ce
+    from sglang.srt.utils.offloader import get_offloader
+
+    if get_offloader().forbid_copy_engine_usage:
+        return copy_list_to_gpu_no_ce(num_recv_tokens_per_expert).to(device)
+
+    return torch.tensor(
+        num_recv_tokens_per_expert,
+        device="cpu",
+        dtype=torch.int32,
+        pin_memory=True,
+    ).to(device, non_blocking=True)
+
+
+def _mxfp4_w4a8_deepep_normal(
+    dispatch_output: DeepEPNormalDispatchOutput,
+    quant_info: Mxfp4W4A8QuantInfo,
+) -> DeepEPNormalCombineInput:
+    from sglang.srt.layers.moe.ep_moe.kernels import ep_gather, ep_scatter
+
+    (
+        hidden_states,
+        hidden_states_scale,
+        topk_ids,
+        topk_weights,
+        num_recv_tokens_per_expert,
+    ) = dispatch_output
+
+    all_tokens = sum(num_recv_tokens_per_expert)
+    if all_tokens == 0:
+        output = torch.empty_like(hidden_states, dtype=torch.bfloat16)
+        return DeepEPNormalCombineInput(
+            hidden_states=output,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+        )
+
+    if quant_info.swiglu_limit is not None:
+        raise NotImplementedError(
+            "mxfp4_w4a8 DeepEP normal path does not support swiglu_limit yet."
+        )
+    if quant_info.w13_weight_scale.dtype != torch.float32:
+        raise NotImplementedError(
+            "mxfp4_w4a8 DeepEP normal path requires float32 w13 scales."
+        )
+    if quant_info.w2_weight_scale.dtype != torch.float32:
+        raise NotImplementedError(
+            "mxfp4_w4a8 DeepEP normal path requires float32 w2 scales."
+        )
+    max_tokens_per_expert = max(num_recv_tokens_per_expert)
+
+    device = hidden_states.device
+    hidden_size = hidden_states.shape[1]
+    num_tokens_per_expert_gpu = _deepep_normal_num_tokens_to_gpu(
+        num_recv_tokens_per_expert,
+        device=device,
+    )
+    expert_start_for_scatter = torch.empty_like(num_tokens_per_expert_gpu)
+    expert_start = torch.empty_like(num_tokens_per_expert_gpu)
+    m_indices = torch.empty(all_tokens, device=device, dtype=torch.int32)
+    output_index = torch.empty(topk_ids.shape, device=device, dtype=torch.int32)
+
+    if hidden_states.dtype == torch.float8_e4m3fn:
+        if hidden_states_scale is None or hidden_states_scale.dtype != torch.float32:
+            raise NotImplementedError(
+                "mxfp4_w4a8 DeepEP normal FP8 path requires float32 scales."
+            )
+        input_tensor = torch.empty(
+            (all_tokens, hidden_size),
+            device=device,
+            dtype=torch.float8_e4m3fn,
+        )
+        input_tensor_scale = torch.empty(
+            (all_tokens, hidden_size // 128),
+            device=device,
+            dtype=torch.float32,
+        )
+        ep_scatter(
+            hidden_states,
+            hidden_states_scale,
+            topk_ids,
+            num_tokens_per_expert_gpu,
+            expert_start_for_scatter,
+            input_tensor,
+            input_tensor_scale,
+            m_indices,
+            output_index,
+            expert_start_out=expert_start,
+        )
+    else:
+        input_tensor_bf16 = torch.empty(
+            (all_tokens, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        ep_scatter(
+            hidden_states,
+            None,
+            topk_ids,
+            num_tokens_per_expert_gpu,
+            expert_start_for_scatter,
+            input_tensor_bf16,
+            None,
+            m_indices,
+            output_index,
+            expert_start_out=expert_start,
+        )
+
+        from sglang.srt.layers.quantization.fp8_kernel import (
+            sglang_per_token_group_quant_fp8,
+        )
+
+        input_tensor, input_tensor_scale = sglang_per_token_group_quant_fp8(
+            input_tensor_bf16,
+            128,
+        )
+        del input_tensor_bf16
+
+    from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+        mxfp4_w4a8_deepep_normal_triton,
+    )
+
+    down_output = mxfp4_w4a8_deepep_normal_triton(
+        input_tensor,
+        input_tensor_scale,
+        expert_start,
+        num_tokens_per_expert_gpu,
+        quant_info.w13_weight,
+        quant_info.w2_weight,
+        quant_info.w13_weight_scale,
+        quant_info.w2_weight_scale,
+        max_tokens_per_expert=max_tokens_per_expert,
+    )
+
+    output = torch.empty(
+        hidden_states.shape,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    ep_gather(down_output, topk_ids, topk_weights, output_index, output)
+    return DeepEPNormalCombineInput(
+        hidden_states=output,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+    )
+
+
+@register_fused_func("deepep", "mxfp4_w4a8")
+def fused_experts_deepep_to_mxfp4_w4a8(
+    dispatch_output: DeepEPLLDispatchOutput | DeepEPNormalDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> DeepEPLLCombineInput | DeepEPNormalCombineInput:
+    if not DispatchOutputChecker.format_is_deepep(dispatch_output):
+        raise NotImplementedError(
+            "mxfp4_w4a8 currently supports DeepEP dispatch only."
+        )
+    _validate_runner_config(runner_config)
     if not isinstance(quant_info, Mxfp4W4A8QuantInfo):
         raise TypeError(f"Unexpected quant_info type: {type(quant_info)}")
+
+    if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
+        return _mxfp4_w4a8_deepep_normal(dispatch_output, quant_info)
 
     hidden_states, hidden_states_scale, topk_ids, topk_weights, masked_m, _ = (
         dispatch_output
@@ -205,6 +364,7 @@ def fused_experts_deepep_to_mxfp4_w4a8(
             hidden_states,
             hidden_states_scale,
             masked_m,
+            topk_ids.shape[0],
             quant_info.w13_weight,
             quant_info.w2_weight,
             quant_info.w13_weight_scale,

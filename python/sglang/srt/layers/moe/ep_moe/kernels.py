@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 
 import torch
 import triton
@@ -723,10 +724,12 @@ def post_reorder_triton_kernel(
 def _fwd_kernel_ep_scatter_1(
     num_recv_tokens_per_expert,
     expert_start_loc,
+    expert_start_out,
     m_indices,
     num_experts: tl.constexpr,
     BLOCK_E: tl.constexpr,
     BLOCK_EXPERT_NUM: tl.constexpr,
+    STORE_EXPERT_START_OUT: tl.constexpr,
 ):
     cur_expert = tl.program_id(0)
 
@@ -738,6 +741,12 @@ def _fwd_kernel_ep_scatter_1(
     )
     cumsum = tl.cumsum(tokens_per_expert) - tokens_per_expert
     tl.store(expert_start_loc + offset_cumsum, cumsum, mask=offset_cumsum < num_experts)
+    if STORE_EXPERT_START_OUT:
+        tl.store(
+            expert_start_out + offset_cumsum,
+            cumsum,
+            mask=offset_cumsum < num_experts,
+        )
 
     cur_expert_start = tl.load(expert_start_loc + cur_expert)
     cur_expert_token_num = tl.load(num_recv_tokens_per_expert + cur_expert)
@@ -846,6 +855,7 @@ def ep_scatter(
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
     scale_ue8m0: bool = False,
+    expert_start_out: Optional[torch.Tensor] = None,
 ):
     BLOCK_E = 128  # token num of per expert is aligned to 128
     BLOCK_D = 128  # block size of quantization
@@ -875,11 +885,13 @@ def ep_scatter(
     _fwd_kernel_ep_scatter_1[(grid,)](
         num_recv_tokens_per_expert,
         expert_start_loc,
+        expert_start_out if expert_start_out is not None else expert_start_loc,
         m_indices,
         num_experts=num_experts,
         num_warps=num_warps,
         BLOCK_E=BLOCK_E,
         BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        STORE_EXPERT_START_OUT=expert_start_out is not None,
     )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
