@@ -46,6 +46,21 @@ MIMO_V2_MODEL_ARCHS = (
 MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
 
 
+def is_mimo_v2_mxfp4_experts(hf_config) -> bool:
+    """Return true for MiMo-V2 checkpoints with MXFP4-packed routed experts."""
+    architectures = getattr(hf_config, "architectures", None) or []
+    if not any(arch in MIMO_V2_MODEL_ARCHS for arch in architectures):
+        return False
+
+    quant_config = getattr(hf_config, "quantization_config", None)
+    if not isinstance(quant_config, dict):
+        return False
+
+    quant_method = str(quant_config.get("quant_method", "")).lower()
+    store_dtype = str(quant_config.get("store_dtype", "")).lower()
+    return quant_method == "fp8" and store_dtype == "mxfp4"
+
+
 def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
     layout = getattr(hf_config, "attention_projection_layout", None)
     if layout is None:
@@ -272,6 +287,13 @@ class ModelConfig:
             n_group = getattr(self.hf_config, "n_group", None)
             if n_group is not None:
                 self.hf_config.topk_group = n_group
+
+        if not self.is_fp4_experts and is_mimo_v2_mxfp4_experts(self.hf_config):
+            self.is_fp4_experts = True
+            logger.info(
+                "Detected MiMoV2 routed-expert layout: is_fp4_experts=True "
+                "(quant_method=fp8, store_dtype=mxfp4)."
+            )
 
         # Check model type
         self.attention_chunk_size = getattr(

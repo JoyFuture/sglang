@@ -1803,6 +1803,7 @@ class ServerArgs:
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
             is_deepseek_dsa,
+            is_mimo_v2_mxfp4_experts,
         )
 
         self.uses_mamba_radix_cache = False
@@ -2249,6 +2250,17 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif model_arch in MIMO_V2_MODEL_ARCHS:
+            if (
+                is_mimo_v2_mxfp4_experts(hf_config)
+                and self.moe_runner_backend == "auto"
+                and (is_sm90_supported() or is_sm120_supported())
+            ):
+                self.moe_runner_backend = "marlin"
+                logger.info(
+                    "Detected MiMoV2 MXFP4 routed experts, using marlin as "
+                    "the MoE runner backend."
+                )
+
             if model_arch == "MiMoV2ForCausalLM" and not self.encoder_only:
                 expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
                     hf_config
