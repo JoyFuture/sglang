@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Optional
 
@@ -148,6 +149,25 @@ def _mxfp4_w4a8_deepep_ll_reference(
     return output
 
 
+def _can_use_triton_path(
+    hidden_states_scale: Optional[torch.Tensor],
+    quant_info: Mxfp4W4A8QuantInfo,
+) -> bool:
+    if os.environ.get("SGLANG_MXFP4_W4A8_REFERENCE", "0") == "1":
+        return False
+    if hidden_states_scale is None:
+        return False
+    if hidden_states_scale.dtype != torch.float32:
+        return False
+    if quant_info.w13_weight_scale.dtype != torch.float32:
+        return False
+    if quant_info.w2_weight_scale.dtype != torch.float32:
+        return False
+    if quant_info.swiglu_limit is not None:
+        return False
+    return True
+
+
 @register_fused_func("deepep", "mxfp4_w4a8")
 def fused_experts_deepep_to_mxfp4_w4a8(
     dispatch_output: DeepEPLLDispatchOutput,
@@ -176,12 +196,27 @@ def fused_experts_deepep_to_mxfp4_w4a8(
             "mxfp4_w4a8 requires DeepEP FP8 dispatch output. "
             "Start the server with --deepep-dispatcher-output-dtype fp8."
         )
-    output = _mxfp4_w4a8_deepep_ll_reference(
-        hidden_states,
-        hidden_states_scale,
-        masked_m,
-        quant_info,
-    )
+    if _can_use_triton_path(hidden_states_scale, quant_info):
+        from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+            mxfp4_w4a8_deepep_ll_triton,
+        )
+
+        output = mxfp4_w4a8_deepep_ll_triton(
+            hidden_states,
+            hidden_states_scale,
+            masked_m,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.w13_weight_scale,
+            quant_info.w2_weight_scale,
+        )
+    else:
+        output = _mxfp4_w4a8_deepep_ll_reference(
+            hidden_states,
+            hidden_states_scale,
+            masked_m,
+            quant_info,
+        )
     return DeepEPLLCombineInput(
         hidden_states=output,
         topk_ids=topk_ids,

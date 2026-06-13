@@ -720,3 +720,62 @@ python3 -m sglang.launch_server \
 - 输出 BF16；
 - 支持 decode CUDA graph capture/replay。
 ```
+
+## 14. 2026-06-13 graph-safe Triton prototype 进展
+
+新增 DeepEP low_latency 专用 Triton prototype：
+
+- 新增 `mxfp4_w4a8_deepep_triton.py`；
+- GEMM1/GEMM2 使用固定 grid grouped masked kernel；
+- kernel 内在线 decode MXFP4/E2M1 packed weight；
+- kernel 内使用 FP32 MXFP4 block scale；
+- kernel 内消费 DeepEP FP8 activation + per-token/group scale；
+- `masked_m` 只在 device 侧读取，不再使用 `masked_m.item()`；
+- 空 expert / 空 token block 在 device 侧 early return，避免 decode 小 batch 跑完整空 expert grid；
+- 中间 SwiGLU + FP8 quant 复用现有 masked activation kernel；
+- fused runner 默认在 scale dtype/layout 可支持时走 Triton 路径；
+- 保留 `SGLANG_MXFP4_W4A8_REFERENCE=1` 强制 reference fallback。
+
+已完成的 synthetic 验证：
+
+- 小尺寸 CUDA case 输出 BF16、finite；
+- 与 PyTorch 参考路径最大误差约 `3.7e-4`；
+- 同一 synthetic case 可完成 `torch.cuda.CUDAGraph` capture/replay。
+- 非 contiguous `hidden_states_scale` + 空 expert case 可完成 `torch.cuda.CUDAGraph` capture/replay。
+
+真实 server 验证进展：
+
+```bash
+python3 -m sglang.launch_server \
+  --model-path /preset-models \
+  --served-model-name mimo-v2-flash \
+  --host 127.0.0.1 \
+  --port 31082 \
+  --tp-size 8 \
+  --trust-remote-code \
+  --quantization fp8 \
+  --moe-a2a-backend deepep \
+  --deepep-mode low_latency \
+  --deepep-dispatcher-output-dtype fp8 \
+  --moe-runner-backend mxfp4_w4a8 \
+  --moe-dense-tp-size 1 \
+  --mem-fraction-static 0.80 \
+  --cuda-graph-bs 1 2 4 8 \
+  --cuda-graph-max-bs 8
+```
+
+结果：
+
+- `disable_cuda_graph=False`；
+- 各 TP rank 均打印 `Capture cuda graph end`；
+- server 成功启动；
+- `/generate` 请求返回 HTTP 200；
+- 第一次真实 capture 暴露 `hidden_states_scale` 非 contiguous，已改成 stride-aware 访问；
+- 由于当前 Triton prototype 仍是 correctness-first kernel，请求延迟很高，不能作为最终性能结果。
+
+仍未完成：
+
+- 当前 Triton kernel 是 correctness / graph-safety prototype，不是最终高性能 Hopper kernel；
+- 只处理 FP32 activation/weight scale layout；其他 scale layout 仍走 reference fallback；
+- 尚未做 decode batch、TP8、DeepEP combine overlap 场景下的完整 benchmark 和稳定性验证。
+- 尚未实现最终 CUTLASS/SM90 级 Hopper kernel 和完整 benchmark。
