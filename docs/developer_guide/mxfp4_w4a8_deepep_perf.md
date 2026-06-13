@@ -88,6 +88,23 @@ Kept changes:
   DeepEP low-latency M dimension.
 - Tuned MXFP4 W4A8 normal and low-latency Triton tile choices for the observed
   MiMoV2 dimensions.
+- Fixed the DeepEP normal-path activation quantization. The normal path now uses
+  the same EP `silu_and_mul_masked_post_quant_fwd` gate/up convention as the
+  low-latency path instead of the generic fused FP8 quant helper.
+
+Correctness note:
+
+- A post-optimization serving smoke test returned repetitive unrelated Chinese
+  tokens for a fixed prompt. Synthetic isolation showed the low-latency Triton
+  path matched the reference within quantization error, but the normal contig
+  path diverged heavily after fused SiLU+mul+FP8 quantization.
+- After the fix, synthetic `mxfp4_w4a8_deepep_normal_triton` output matches the
+  equivalent low-latency padded Triton path exactly for the tested routed-token
+  layout: `max_abs_diff=0.0`, `mean_abs_diff=0.0`.
+- The full DeepEP normal path including `ep_scatter` and `ep_gather` also matches
+  manual aggregation over the low-latency Triton output exactly for the tested
+  `16 tokens x topk 8` synthetic case: `max_abs_diff=0.0`,
+  `mean_abs_diff=0.0`.
 
 Tried and reverted:
 
@@ -107,22 +124,42 @@ All rows use fixed 512 input tokens and 64 output tokens.
 | No DeepEP, W4A16-like baseline | 8 | 399.20 | 86.95 | 87.05 | Previous reference run |
 | DeepEP auto before these optimizations | 1 | 2636.54 | 81.27 | - | After earlier fused activation/max work |
 | DeepEP auto before these optimizations | 8 | 7400.12 | 141.80 | - | After earlier fused activation/max work |
-| Final MXFP4 W4A8 DeepEP auto | 1 | 332.50 | 68.58 | 13.73 | Warm-server run |
-| Final MXFP4 W4A8 DeepEP auto | 8 | 750.84 | 106.57 | 67.67 | Average of two warm-server runs |
+| MXFP4 W4A8 DeepEP auto before correctness fix | 1 | 332.50 | 68.58 | 13.73 | Warm-server run; later found to produce bad text |
+| MXFP4 W4A8 DeepEP auto before correctness fix | 8 | 750.84 | 106.57 | 67.67 | Average of two warm-server runs; later found to produce bad text |
+| Correctness-fixed MXFP4 W4A8 DeepEP auto | 1 | 1559.08 | 69.13 | 10.80 | Warm-server run after normal-path activation quantization fix |
+| Correctness-fixed MXFP4 W4A8 DeepEP auto | 8 | 695.21 | 107.75 | 67.46 | Warm-server run after normal-path activation quantization fix |
 
-Final deltas versus the previous DeepEP auto path:
-
-| Concurrency | TTFT Delta | TPOT Delta |
-|---|---:|---:|
-| 1 | -87.39% | -15.61% |
-| 8 | -89.85% | -24.84% |
-
-Final deltas versus the no-DeepEP W4A16-like reference:
+Correctness-fixed deltas versus the previous DeepEP auto path:
 
 | Concurrency | TTFT Delta | TPOT Delta |
 |---|---:|---:|
-| 1 | +64.44% | -20.38% |
-| 8 | +88.08% | +22.56% |
+| 1 | -40.87% | -14.94% |
+| 8 | -90.61% | -24.01% |
+
+Correctness-fixed deltas versus the no-DeepEP W4A16-like reference:
+
+| Concurrency | TTFT Delta | TPOT Delta |
+|---|---:|---:|
+| 1 | +671.06% | -19.74% |
+| 8 | +74.15% | +23.92% |
+
+Correctness-fixed deltas versus the bad-text pre-correctness MXFP4 W4A8 DeepEP
+path:
+
+| Concurrency | TTFT Delta | TPOT Delta |
+|---|---:|---:|
+| 1 | +368.90% | +0.80% |
+| 8 | -7.41% | +1.11% |
+
+Serving smoke after the correctness fix:
+
+- Fixed prompt `请只回答：北京是中国的首都。` no longer produced the prior repeated
+  unrelated Chinese tokens. With the configured reasoning parser, the response
+  emitted semantic reasoning text in `reasoning_content`.
+- Fixed prompt `用一句话说明水的化学式是什么。` returned a normal Chinese answer:
+  water is `H2O`.
+- Server logs confirmed decode CUDA graph replay during smoke and benchmark
+  requests with `cuda graph: True`.
 
 ## Current Bottleneck
 

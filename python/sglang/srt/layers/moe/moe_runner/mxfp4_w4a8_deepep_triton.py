@@ -639,20 +639,30 @@ def mxfp4_w4a8_deepep_normal_triton(
         max_m=max_tokens_per_expert,
     )
 
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8,
+    down_input_3d = torch.empty(
+        (1, total_m, intermediate_size),
+        device=hidden_states.device,
+        dtype=torch.float8_e4m3fn,
     )
-
-    down_input, down_input_scale = sglang_per_token_group_quant_fp8(
-        gateup_output,
+    down_input_scale_3d = torch.empty(
+        (1, total_m, intermediate_size // 128),
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    all_tokens_mask = torch.empty((1,), device=hidden_states.device, dtype=torch.int32)
+    all_tokens_mask.fill_(total_m)
+    silu_and_mul_masked_post_quant_fwd(
+        gateup_output.unsqueeze(0),
+        down_input_3d,
+        down_input_scale_3d,
         128,
-        fuse_silu_and_mul=True,
+        all_tokens_mask,
     )
     del gateup_output
 
     return _launch_grouped_gemm_contig(
-        down_input,
-        down_input_scale,
+        down_input_3d.squeeze(0),
+        down_input_scale_3d.squeeze(0),
         w2_weight,
         w2_weight_scale,
         expert_start,
