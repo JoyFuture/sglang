@@ -295,6 +295,13 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+
+            if self.is_fp4_experts and get_moe_runner_backend().is_mxfp4_w4a8():
+                from sglang.srt.layers.quantization.mxfp4_w4a8_moe import (
+                    Mxfp4W4A8MoEMethod,
+                )
+
+                return Mxfp4W4A8MoEMethod(fp8_method, prefix=prefix)
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)

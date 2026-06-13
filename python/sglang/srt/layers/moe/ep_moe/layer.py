@@ -101,6 +101,11 @@ class DeepEPMoE(FusedMoE):
         ):
             self.deprecate_flag = True
         elif (
+            get_moe_runner_backend().is_mxfp4_w4a8()
+            and get_moe_a2a_backend().is_deepep()
+        ):
+            self.deprecate_flag = True
+        elif (
             quant_config is None
             and self.w13_weight.dtype == torch.bfloat16
             and get_moe_runner_backend().is_deep_gemm()
