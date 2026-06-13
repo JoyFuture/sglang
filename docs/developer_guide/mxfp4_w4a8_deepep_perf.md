@@ -92,6 +92,18 @@ This captured `Capture cuda graph bs [8, 16, 32, 64]` and confirmed decode graph
 replay at C64, but it was slower than the C32 run for this fixed 512-in/64-out
 random-ids benchmark.
 
+A C128 memory-profile run used:
+
+```bash
+--max-total-tokens 98304 \
+--cuda-graph-bs 8 16 32 64 128 \
+--cuda-graph-max-bs 128
+```
+
+This captured `Capture cuda graph bs [8, 16, 32, 64, 128]` and confirmed decode
+graph replay at C128. It improved aggregate output throughput versus C32/C64,
+but TTFT and TPOT regressed substantially.
+
 ## Implemented Changes
 
 Kept changes:
@@ -188,12 +200,20 @@ All rows use fixed 512 input tokens and 64 output tokens.
 | Larger CUDA graph capture default | 16 | 1058.82 | 41.33 | 276.84 | `--num-prompts 16 --max-concurrency 16`; decode graph true |
 | Larger CUDA graph capture default | 32 | 1412.19 | 52.63 | 429.44 | `--num-prompts 32 --max-concurrency 32`; decode graph true |
 | Larger CUDA graph C64 memory run | 64 | 4687.66 | 84.18 | 407.83 | `--max-total-tokens 49152 --cuda-graph-bs 8 16 32 64`; decode graph true |
+| Larger CUDA graph C128 memory run | 128 | 8694.16 | 131.97 | 480.03 | `--max-total-tokens 98304 --cuda-graph-bs 8 16 32 64 128`; decode graph true |
 
 The C64 benchmark completed `64/64` requests with `32768` input tokens and
 `4096` output tokens in `10.04 s`. Mean end-to-end latency was `9991.00 ms`;
 median/P99 TTFT were `5260.15 ms` and `6926.94 ms`, and median/P99 TPOT were
 `75.13 ms` and `145.49 ms`. This makes C64 a regression versus C32 for the
 current benchmark shape despite fitting in memory.
+
+The C128 benchmark completed `128/128` requests with `65536` input tokens and
+`8192` output tokens in `17.07 s`. Mean end-to-end latency was `17008.43 ms`;
+median/P99 TTFT were `9163.20 ms` and `13715.25 ms`, and median/P99 TPOT were
+`124.45 ms` and `254.63 ms`. C128 produced the highest aggregate output
+throughput observed so far, but it is a latency regression and should not be the
+default for latency-sensitive serving.
 
 Correctness-fixed deltas versus the previous DeepEP auto path:
 
@@ -327,7 +347,19 @@ Serving smoke after expanding decode CUDA graph capture to bs 64:
 - Server logs confirmed CUDA graph capture `Capture cuda graph bs [8, 16, 32,
   64]` and decode graph replay at C64 with `cuda graph: True`.
 
-## C64 CUDA Graph Memory Profile
+Serving smoke after expanding decode CUDA graph capture to bs 128:
+
+- Short prompt `1+1等于几？只回答数字。` returned normal content: `2` with
+  `max_tokens=64`.
+- The same prompt with `max_tokens=16` returned empty `content` because all
+  generated tokens were spent in `reasoning_content`; this is a request budget
+  issue rather than a bad-text regression.
+- Server logs confirmed CUDA graph capture `Capture cuda graph bs [8, 16, 32,
+  64, 128]` and decode graph replay at C128 with `cuda graph: True`.
+
+## Large CUDA Graph Memory Profiles
+
+### C64
 
 Run config:
 
@@ -360,6 +392,38 @@ it can miss sub-second peaks. Decode logs reached about `0.79` full-token usage
 and `0.93` SWA-token usage, so the C64 run was close to the configured SWA pool
 capacity with `--max-total-tokens 49152`.
 
+### C128
+
+Run config:
+
+```bash
+--mem-fraction-static 0.80 \
+--max-total-tokens 98304 \
+--chunked-prefill-size 2048 \
+--context-length 8192 \
+--cuda-graph-bs 8 16 32 64 128 \
+--cuda-graph-max-bs 128
+```
+
+Memory sources were the SGLang startup log and a 1-second `nvidia-smi` sampler.
+SGLang reports decimal `GB`; `nvidia-smi` reports `MiB`.
+
+| Stage | Per-GPU memory | Remaining memory | Notes |
+|---|---:|---:|---|
+| Empty GPU baseline | `0 MiB` used by `nvidia-smi` | `143167 MiB` free | `143771 MiB` total reported by `nvidia-smi` |
+| After weight load | `77.19 GB` load delta | `60.75-60.98 GB` available | Same model resident memory as the C64 run |
+| KV/SWA cache pool | `3.40 GB` reported pool | `57.06-57.30 GB` available after memory pool | SWA cache `78643` tokens plus full cache `98304` tokens |
+| KV/SWA cache components | `1.69 + 1.13 + 0.35 + 0.23 GB` | Included above | K/V for SWA cache plus K/V for full cache |
+| CUDA graph capture | `9.20-10.38 GB` capture delta | `46.59-48.00 GB` available after capture | Rank 0 was `10.14 GB` delta and `46.87 GB` available |
+| Idle after C128 benchmark | `95022-96582 MiB` used | `46586-48146 MiB` free | Last sampled `nvidia-smi` values after the benchmark |
+| Peak sampled use | `95230-96670 MiB` used | `46498-47938 MiB` free | Peak over the full 246.8-second sampling window |
+
+During the C128 benchmark window, the 1-second sampler saw per-GPU memory rise
+by `408-866 MiB` from the first in-window sample to the peak in-window sample,
+again roughly `0.4-0.9 GiB` per GPU for activation/temp buffers at sampler
+granularity. Decode logs reached about `0.79` full-token usage and `0.92`
+SWA-token usage with `--max-total-tokens 98304`.
+
 ## Current Bottleneck
 
 The current Hopper dot_scaled path keeps the checkpoint layout and avoids manual
@@ -376,5 +440,6 @@ additional GPU memory. The next large performance step is likely one of:
 - a deeper DeepEP low-latency path that reduces TTFT under higher concurrency.
   Expanding CUDA graph capture to bs 32 improves graph coverage and throughput
   at C16/C32, but TTFT grows with concurrent prefill and decode pressure. The
-  C64 memory-profile run fit, but it did not improve throughput and had much
-  worse TTFT/TPOT than C32 for the current benchmark shape.
+  C64 memory-profile run fit, but it did not improve throughput. C128 gave the
+  highest aggregate output throughput so far, but the TTFT/TPOT regression makes
+  it a throughput-only profile rather than a latency-serving default.
