@@ -38,6 +38,9 @@ _USE_HUMMING_NORMAL = _USE_HUMMING_NORMAL or _HUMMING_REPLACE_WEIGHTS
 _ALLOW_HUMMING_NORMAL_FALLBACK = (
     os.environ.get("SGLANG_MXFP4_W4A8_HUMMING_ALLOW_FALLBACK", "0") != "0"
 )
+_USE_HUMMING_PREFILL_TUNING = (
+    os.environ.get("SGLANG_MXFP4_W4A8_HUMMING_PREFILL_TUNING", "1") != "0"
+)
 _HUMMING_NORMAL_CACHE = {}
 _HUMMING_EXPERT_LAYOUT_CACHE = {}
 _HUMMING_NORMAL_SKIP_KEYS = set()
@@ -955,6 +958,66 @@ def _import_humming():
     return GemmType, HummingLayer, get_heuristics_config
 
 
+def _humming_prefill_tuning_overrides(
+    n: int,
+    k: int,
+) -> list[tuple[int, int, dict[str, Any]]]:
+    if not _USE_HUMMING_PREFILL_TUNING:
+        return []
+
+    tuned_warp_n32_bm48 = {
+        "block_shape": (48, 128, 128),
+        "warp_shape": (48, 32, 128),
+        "use_stream_k": True,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2,
+    }
+    tuned_warp_n32_bm64 = {
+        "block_shape": (64, 128, 128),
+        "warp_shape": (64, 32, 128),
+        "use_stream_k": True,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2,
+    }
+
+    if n == 4096 and k == 6144:
+        return [
+            (4096, 12288, tuned_warp_n32_bm48),
+            (12288, 1 << 30, tuned_warp_n32_bm64),
+        ]
+    if n == 6144 and k == 2048:
+        return [(4096, 1 << 30, tuned_warp_n32_bm48)]
+    return []
+
+
+def _apply_humming_prefill_tuning(
+    tuning_config: Any,
+    n: int,
+    k: int,
+) -> Any:
+    overrides = _humming_prefill_tuning_overrides(n, k)
+    if not overrides:
+        return tuning_config
+
+    if isinstance(tuning_config, dict):
+        return overrides[-1][2]
+    if not isinstance(tuning_config, list):
+        return tuning_config
+
+    min_override_m = min(start for start, _, _ in overrides)
+    tuned_config = [
+        entry
+        for entry in tuning_config
+        if len(entry) == 3 and entry[1] <= min_override_m
+    ]
+    tuned_config.extend([list(item) for item in overrides])
+    return tuned_config
+
+
 def _build_humming_weight_entry(
     b_packed: torch.Tensor,
     b_scale: torch.Tensor,
@@ -1012,10 +1075,14 @@ def _build_humming_weight_entry(
         k=k,
         num_experts=num_experts,
         contig_compute_config=contig_compute_config,
-        contig_tuning_config=get_heuristics_config(
-            meta=meta,
-            use_f16_accum=False,
-            gemm_type=GemmType.GROUPED_CONTIGUOUS,
+        contig_tuning_config=_apply_humming_prefill_tuning(
+            get_heuristics_config(
+                meta=meta,
+                use_f16_accum=False,
+                gemm_type=GemmType.GROUPED_CONTIGUOUS,
+            ),
+            n,
+            k,
         ),
         masked_compute_config=masked_compute_config,
         masked_tuning_config=get_heuristics_config(

@@ -250,3 +250,118 @@ SGLang 仓库已有 `cutlass_w4a8_moe.py`，但它不是当前 MXFP4 W4A8 normal
 - 小尺寸 low-latency 两段 GEMM：有效 token 行 vs Triton reference，`valid_max_abs_err=1.62e-05`，`allclose_valid_2e-2=true`。
 
 这个实现解决的是用户服务中看到的根因：之前 Humming 在模型加载后或首次 forward 时还要额外构建 repacked weight cache，显存会从“原始 MXFP4 权重”变成“原始 MXFP4 权重 + Humming repacked 权重”。现在 Humming 模式下原始权重会被替换和释放，峰值额外内存只出现在单层转换过程中，常驻权重以内核实际使用的 Humming layout 为主。
+
+## 2026-06-16 追加：Humming grouped-contiguous 单 kernel NCU
+
+按用户要求单独跑了 Humming steady-state grouped-contiguous GEMM 的 NCU。采集方式：
+
+- 只 profile Humming GEMM 本体。
+- Humming layer 构建、weight repack、NVRTC/JIT、warmup 都在 capture 外。
+- 形状仍是本地 synthetic skew：
+  - w13-like：`N=4096,K=6144,total_m=16384,E=48`
+  - w2-like：`N=6144,K=2048,total_m=16384,E=48`
+
+报告位置：
+
+- `profile/mxfp4_w4a8_prefill_local_harness_20260616/reports/humming_w13_grouped_contig_full.ncu-rep`
+- `profile/mxfp4_w4a8_prefill_local_harness_20260616/reports/humming_w2_grouped_contig_full.ncu-rep`
+- `profile/mxfp4_w4a8_prefill_local_harness_20260616/analysis/details_humming_w13_grouped_contig_full.txt`
+- `profile/mxfp4_w4a8_prefill_local_harness_20260616/analysis/details_humming_w2_grouped_contig_full.txt`
+
+关键指标：
+
+| shape | NCU duration | SM throughput | Memory throughput | DRAM throughput | L1/TEX throughput | achieved occupancy | registers/thread | grid |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| w13-like | `3.96 ms` | `58.85%` | `66.56%` | `9.47%` | `67.46%` | `21.72%` | `128` | `264` CTAs |
+| w2-like | `2.11 ms` | `58.12%` | `65.21%` | `8.89%` | `66.07%` | `21.89%` | `128` | `264` CTAs |
+
+与当前 Triton optimized NCU 对比：
+
+- Triton w13-like：`7.85 ms`，Humming w13-like：`3.96 ms`，NCU 口径约 `1.98x`。
+- Triton w2-like：`3.98 ms`，Humming w2-like：`2.11 ms`，NCU 口径约 `1.89x`。
+- Triton 的 uncoalesced global excessive sectors 约 `54%-55%`，Humming 降到 `7%-8%`。
+- Triton 的 uncoalesced shared excessive wavefronts 约 `28%`，Humming 降到约 `9%`。
+- Triton `registers/thread=168` 后 occupancy 约 `18.6%`，Humming `registers/thread=128`，occupancy 约 `21.8%`。
+- Triton grid 是 `num_experts * ceil(max_m / 64) * ceil(N / 128)`，本地 skew case 下会发 `21504/32256` 个 CTA；Humming 只发 `264` 个 CTA，说明它按真实 expert token layout 调度有效 M tile，避免大量 early-return 空 CTA。
+
+瓶颈判断：
+
+- Humming 仍不是 DRAM bandwidth-bound：DRAM throughput 只有约 `9%`。
+- Humming 的 L1/TEX 和 memory throughput 仍高于 DRAM，说明主要压力仍在片上访存、scale/weight layout、pipeline 和调度，而不是 HBM 带宽。
+- 相比 Triton，Humming 已明显缓解 uncoalesced global/shared access 和 grouped GEMM 空 CTA，因此性能提升主要来自 weight repack layout、有效 tile scheduler、CUDA/WGMMA pipeline，而不是单纯更高 HBM 带宽。
+- Humming 当前剩余瓶颈更像 compute/memory mixed：SM throughput 约 `58%`，memory throughput 约 `65%-67%`，NCU 也判断 compute 和 memory 较均衡。继续优化需要同时减少 scale/FP4 handling 指令、片上访存 transaction，以及提高 eligible warp/issue slot。
+
+## 2026-06-16 追加：Humming grouped-contiguous tuning 覆盖
+
+继续优化时没有直接修改 Humming CUDA 源码，而是先扫描 Humming 已暴露的 tuning knobs：
+
+- `block_shape`
+- `warp_shape`
+- `num_sms`
+- `num_stages`
+- `num_ctas_per_sm`
+- `use_stream_k`
+
+原因是这些配置可以在 SGLang 集成层覆盖，验证和回滚成本明显低于直接改 Humming `.cuh`。本轮 synthetic skew 条件：
+
+- `total_m=16384`
+- `num_experts=48`
+- `seed=0`
+- w13-like：`N=4096,K=6144`
+- w2-like：`N=6144,K=2048`
+
+扫描结果：
+
+| shape | Humming heuristic | best tuned | tuned config | speedup |
+| --- | ---: | ---: | --- | ---: |
+| w13-like | `3.068 ms` | `2.615 ms` | `BM64/BN128/BK128, WM64/WN32/WK128, stages4, ctas2, num_sms132` | `1.17x` |
+| w2-like | `1.780 ms` | `1.397 ms` | `BM48/BN128/BK128, WM48/WN32/WK128, stages4, ctas2, num_sms132` | `1.27x` |
+
+短迭代 8k 检查显示：
+
+| shape | Humming heuristic | best tuned | tuned config |
+| --- | ---: | ---: | --- |
+| w13-like 8k | `1.727 ms` | `1.425 ms` | `BM48/BN128/BK128, WN32` |
+| w2-like 8k | `1.051 ms` | `0.777 ms` | `BM48/BN128/BK128, WN32` |
+
+因此当前 SGLang 覆盖策略：
+
+- 仅影响 Humming normal grouped-contiguous path。
+- 仅覆盖 `shape_m > 4096` 的 prefill/extend 大 M 区间，小 batch 和 decode 保持 Humming heuristic。
+- w13-like `N=4096,K=6144`：
+  - `4096 < M <= 12288`：`BM48/WN32`
+  - `M > 12288`：`BM64/WN32`
+- w2-like `N=6144,K=2048`：
+  - `M > 4096`：`BM48/WN32`
+- 可用 `SGLANG_MXFP4_W4A8_HUMMING_PREFILL_TUNING=0` 关闭该覆盖。
+
+SGLang 集成层验证结果：
+
+| shape | Triton harness | Humming tuned via SGLang entry | speedup vs Triton | correctness |
+| --- | ---: | ---: | ---: | --- |
+| w13-like 16k | `5.954 ms` | `2.695 ms` | `2.21x` | `allclose_1e-2=true`, `max_abs_err=2.44e-4` |
+| w2-like 16k | `3.037 ms` | `1.465 ms` | `2.07x` | `allclose_1e-2=true`, `max_abs_err=1.22e-4` |
+
+这轮结果说明：Humming 默认 heuristic 对 H20/Hopper 上的 MXFP4 W4A8 grouped-contiguous 大 M MoE shape 仍有明显 tuning 空间，主要收益来自把 `warp_shape_n` 从 `16` 调到 `32`，并在 w2/down-proj 上使用 `block_m=48`。`num_sms`、`num_ctas_per_sm`、`block_n=256`、`block_k=256` 等方向大多无收益或明显退化。
+
+随后对 tuned config 重新采了单 kernel NCU：
+
+| shape | old Humming NCU | tuned Humming NCU | SM throughput | Memory throughput | DRAM throughput | L1/TEX throughput | achieved occupancy | registers/thread | excessive global sectors | excessive shared wavefronts |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| w13-like | `3.96 ms` | `3.37 ms` | `58.48%` | `40.65%` | `7.62%` | `41.40%` | `12.46%` | `255` | `9%` | `4%` |
+| w2-like | `2.11 ms` | `1.77 ms` | `61.14%` | `41.57%` | `7.90%` | `42.59%` | `12.31%` | `254` | `7%` | `4%` |
+
+NCU 解读：
+
+- tuned config 的 duration 比旧 Humming NCU 继续下降约 `15%-16%`。
+- `warp_shape_n=32` 后 block size 从旧配置的 `256` threads 降到 `128` threads，但每线程寄存器升到约 `254-255`，理论/实际 occupancy 降到约 `12.5%/12.3%`。
+- 尽管 occupancy 更低，SM throughput 仍在 `58%-61%`，memory throughput 从旧配置约 `65%-67%` 降到约 `41%-42%`，说明这轮收益主要来自减少片上/内存 transaction 和改善 tile work distribution，而不是提升 resident warp 数。
+- DRAM throughput 仍只有约 `8%`，因此 tuned Humming 依然不是 HBM 带宽受限。
+- excessive shared wavefronts 从旧配置约 `9%` 降到约 `4%`；global excessive sectors 维持在 `7%-9%`。下一步源码级优化更应该盯 shared/local/register pressure 和 scale/FP4 handling，而不是单纯调 HBM 访问。
+
+下一步如果继续向下优化，再考虑 Humming 源码级改动：
+
+- 针对 FP8 activation + FP4 E2M1 weight + bf16 scale + grouped-contiguous 写更专门的 scale load/apply 路径。
+- 检查 NCU 中 local memory / shared wavefront 的剩余浪费。
+- 评估 grouped scheduler 是否能减少每 CTA 的控制开销。
+- 评估让 DeepEP normal scatter 直接产出 Humming `expert_layout`，避免每次 GEMM 前更新布局缓存。
