@@ -971,24 +971,11 @@ def _humming_prefill_tuning_overrides(
         "use_stream_k": True,
         "use_f16_accum": False,
         "num_sms": 132,
-        "num_stages": 4,
+        "num_stages": 3,
         "num_ctas_per_sm": 2,
     }
-    tuned_warp_n32_bm64 = {
-        "block_shape": (64, 128, 128),
-        "warp_shape": (64, 32, 128),
-        "use_stream_k": True,
-        "use_f16_accum": False,
-        "num_sms": 132,
-        "num_stages": 4,
-        "num_ctas_per_sm": 2,
-    }
-
     if n == 4096 and k == 6144:
-        return [
-            (4096, 12288, tuned_warp_n32_bm48),
-            (12288, 1 << 30, tuned_warp_n32_bm64),
-        ]
+        return [(4096, 1 << 30, tuned_warp_n32_bm48)]
     if n == 6144 and k == 2048:
         return [(4096, 1 << 30, tuned_warp_n32_bm48)]
     return []
@@ -1186,7 +1173,7 @@ def _launch_grouped_gemm_contig_humming_entry(
     layout_key = (
         expert_start.device.index,
         torch.cuda.current_stream(expert_start.device).cuda_stream,
-        str(expert_start.dtype),
+        "torch.int32",
         num_tokens_per_expert.shape[0],
     )
     expert_layout = _HUMMING_EXPERT_LAYOUT_CACHE.get(layout_key)
@@ -1194,7 +1181,7 @@ def _launch_grouped_gemm_contig_humming_entry(
         expert_layout = torch.empty(
             (num_tokens_per_expert.shape[0] + 1,),
             device=expert_start.device,
-            dtype=expert_start.dtype,
+            dtype=torch.int32,
         )
         _HUMMING_EXPERT_LAYOUT_CACHE[layout_key] = expert_layout
     expert_layout[:-1].copy_(expert_start)

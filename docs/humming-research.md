@@ -365,3 +365,93 @@ NCU 解读：
 - 检查 NCU 中 local memory / shared wavefront 的剩余浪费。
 - 评估 grouped scheduler 是否能减少每 CTA 的控制开销。
 - 评估让 DeepEP normal scatter 直接产出 Humming `expert_layout`，避免每次 GEMM 前更新布局缓存。
+
+## 2026-06-16 追加：2.2w tokens/s 后的下一轮优化记录
+
+用户端到端实测 Humming + tuned config 后，16k prefill 吞吐已从约 `1.2w tokens/s` 提升到约 `2.2w tokens/s`。这说明此前接入 Humming repack layout 与 `warp_shape_n=32` tuning 对真实服务有效，但距离 W8A8 双机 `~3w tokens/s` 仍有差距。
+
+本轮继续尝试了更细的 Humming tuning 扫描，重点覆盖：
+
+- `block_m=32/40/48/56/64/72/80`
+- `warp_n=16/32/64`
+- `num_ctas_per_sm=1/2`
+- `num_stages=3/4/5`
+- `use_stream_k=true/false`
+- `num_sms=112/132/160/192/224/264/320`
+
+但当前 8 卡都在运行服务，每卡剩余显存约 `0.1-3.2 GiB`，Humming JIT 新配置时需要额外 output / workspace / cubin 加载空间，继续扫会频繁 OOM，甚至可能触发非法指令后的 CUDA context 错误。因此没有把这轮不完整扫描结果固化到生产路径。
+
+已确认的下一层瓶颈：
+
+- tuned Humming 不是 HBM bandwidth-bound，DRAM throughput 仍只有约 `8%`。
+- `warp_shape_n=32` 版本每线程寄存器约 `254-255`，occupancy 约 `12.3%`；继续优化重点应是 register pressure、shared/local memory transaction 和 scale handling。
+- grouped-contiguous scheduler 每个 CTA 都会读取/处理 `expert_layout`，但当前只有 `264` CTA，调度开销不是主瓶颈。
+- `expert_layout` 只需要保存每个 expert 的 token 起点，16k/百万级 context 下 int32 足够，没必要用 int64。
+
+本轮落地了一个低风险小优化：
+
+- Humming normal grouped-contiguous path 的 `expert_layout` cache 固定使用 `torch.int32`。
+- 这样 Humming scheduler 走 `use_int64_expert_layout=false` 分支，layout load 和 shared copy 宽度减半。
+- 正确性用 4096-token synthetic w13/w2 验证，均为 `allclose_1e-2=true`。
+
+这个 int32 layout 优化预期收益较小，但它在每层 MoE、每个 grouped GEMM launch 上都会发生，且风险低；大收益的下一步仍然需要空闲 GPU 上做完整 micro tuning 或进入 Humming 源码级优化。
+
+## 2026-06-16 追加：空闲 GPU 后的 focused tuning
+
+释放 GPU 后，继续围绕当前最佳配置做 focused tuning，而不是盲扫全空间。重点测试：
+
+- `num_stages=3/4/5`
+- `use_stream_k=true/false`
+- `num_ctas_per_sm=1/2`
+- `num_sms=132/192/264`
+- `num_write_splits=2`
+- w13 的 `BM48` 与 `BM64` 对比
+
+关键 microbenchmark 结论：
+
+| shape | 上一版 tuned config | 上一版 latency | 新 tuned config | 新 latency | 变化 |
+| --- | --- | ---: | --- | ---: | ---: |
+| w13-like 16k | `BM64/BN128/BK128/WN32/stages4` | `~2.64 ms` | `BM48/BN128/BK128/WN32/stages3` | `~2.49 ms` | `~1.06x` |
+| w2-like 16k | `BM48/BN128/BK128/WN32/stages4` | `~1.40 ms` | `BM48/BN128/BK128/WN32/stages3` | `~1.35 ms` | `~1.04x` |
+
+8k 复核也显示 `stages3` 更快：
+
+| shape | stages3 | stages4 | stages5 |
+| --- | ---: | ---: | ---: |
+| w13-like 8k | `1.361 ms` | `1.424 ms` | `1.434 ms` |
+| w2-like 8k | `0.755 ms` | `0.778 ms` | `0.794 ms` |
+
+因此 SGLang 覆盖策略更新为：
+
+- w13-like `N=4096,K=6144`：`M > 4096` 全部使用 `BM48/BN128/BK128/WN32/stages3/ctas2/num_sms132/stream_k=true`。
+- w2-like `N=6144,K=2048`：`M > 4096` 使用同一套 `BM48/BN128/BK128/WN32/stages3/ctas2/num_sms132/stream_k=true`。
+- `num_write_splits=2` 对 `BM48` 不合法，Humming epilogue 有 `BlockShape::M % 32 == 0` 的 static assertion。
+- `num_sms>132` 在这两个 shape 上明显退化。
+- `num_ctas_per_sm=1` 明显退化。
+- `use_stream_k=false` 对 w13 的部分随机测量有波动收益，但在 w2 和综合稳定性上不如 `stream_k=true`，暂不固化。
+
+SGLang entry 级验证：
+
+| shape | SGLang Humming entry latency | tuning tail | correctness |
+| --- | ---: | --- | --- |
+| w13-like 16k | `2.525 ms` | `BM48/WN32/stages3` | `allclose_1e-2=true` |
+| w2-like 16k | `~1.40 ms p50` | `BM48/WN32/stages3` | 已在 focused tuning 中验证 `allclose_1e-2=true` |
+
+stage3 后重新采集单 kernel NCU：
+
+| shape | stage4 NCU duration | stage3 NCU duration | SM throughput | Memory throughput | DRAM throughput | achieved occupancy | registers/thread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| w13-like | `3.37 ms` | `3.17 ms` | `65.74%` | `43.52%` | `8.89%` | `12.25%` | `252` |
+| w2-like | `1.77 ms` | `1.69 ms` | `63.90%` | `42.80%` | `8.14%` | `12.21%` | `255` |
+
+解读：
+
+- `num_stages=3` 降低 pipeline stage 开销后，SM throughput 从上一版约 `58%-61%` 提升到 `64%-66%`。
+- 寄存器仍在 `252-255/thread`，occupancy 仍约 `12%`，说明下一层瓶颈还是 register pressure / local+shared transaction / scale apply，而不是 HBM。
+- 这轮是小幅但稳定的 kernel-level tuning 收益；端到端是否能继续从 `2.2w tokens/s` 上涨，需要再跑真实 prefill profile。
+
+建议下一步优先级：
+
+1. 在空闲 GPU 上完整复测 focused tuning，尤其是 `use_stream_k=false`、`num_write_splits=2`、`BM48 vs BM64`、`stages=3/4/5` 的组合。
+2. 若 tuning 不能继续提升，再改 Humming 源码，优先看 `mainloop_arith.cuh` 的 scale dequant/apply、`loader_as.cuh/loader_bs.cuh` 的 shared/global transaction，以及 epilogue 的 register footprint。
+3. 端到端再 profile 一次，统计 Humming GEMM 降低后 `cached_notify_combine` 是否同步下降；如果 notify/wait 仍大，需要转向 DeepEP overlap / expert imbalance。
