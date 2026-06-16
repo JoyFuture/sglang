@@ -80,6 +80,37 @@ class Mxfp4W4A8MoEMethod:
 
         layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
         layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+        if os.environ.get("SGLANG_MXFP4_W4A8_USE_HUMMING_NORMAL", "0") != "0" or (
+            os.environ.get("SGLANG_MXFP4_W4A8_HUMMING_REPLACE_WEIGHTS", "0") != "0"
+        ):
+            from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+                replace_mxfp4_w4a8_weights_with_humming,
+                should_replace_humming_normal_weights,
+            )
+
+            if should_replace_humming_normal_weights():
+                replace_mxfp4_w4a8_weights_with_humming(layer)
+            else:
+                from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+                    prepare_humming_normal_weight_cache,
+                )
+
+                prepare_humming_normal_weight_cache(
+                    layer.w13_weight,
+                    layer.w2_weight,
+                    layer.w13_weight_scale_inv,
+                    layer.w2_weight_scale_inv,
+                )
+
+        if hasattr(layer, "w13_humming_weight"):
+            layer._dsv4_mxfp4_backend = "mxfp4_w4a8_humming"
+            log_info_on_rank0(
+                logger,
+                f"Using Humming MXFP4 W4A8 repacked weights for MoE layer "
+                f"{self.prefix}.",
+            )
+            return
+
         layer.register_buffer(
             "w13_weight_scale_e8m0",
             _mxfp4_scale_to_e8m0(layer.w13_weight_scale_inv.data),
@@ -106,12 +137,14 @@ class Mxfp4W4A8MoEMethod:
         )
 
         quant_info = Mxfp4W4A8QuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
-            w13_weight_scale=layer.w13_weight_scale_inv,
-            w2_weight_scale=layer.w2_weight_scale_inv,
-            w13_weight_scale_e8m0=layer.w13_weight_scale_e8m0,
-            w2_weight_scale_e8m0=layer.w2_weight_scale_e8m0,
+            w13_weight=getattr(layer, "w13_weight", None),
+            w2_weight=getattr(layer, "w2_weight", None),
+            w13_weight_scale=getattr(layer, "w13_weight_scale_inv", None),
+            w2_weight_scale=getattr(layer, "w2_weight_scale_inv", None),
+            w13_weight_scale_e8m0=getattr(layer, "w13_weight_scale_e8m0", None),
+            w2_weight_scale_e8m0=getattr(layer, "w2_weight_scale_e8m0", None),
+            humming_w13_weight=getattr(layer, "w13_humming_weight", None),
+            humming_w2_weight=getattr(layer, "w2_humming_weight", None),
             swiglu_limit=self.moe_runner_config.swiglu_limit,
         )
         return self.runner.run(dispatch_output, quant_info=quant_info)

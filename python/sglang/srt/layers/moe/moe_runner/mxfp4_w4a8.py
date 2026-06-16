@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 import torch
 import torch.nn.functional as F
@@ -23,13 +23,18 @@ from sglang.srt.layers.moe.token_dispatcher.deepep import (
 
 @dataclass
 class Mxfp4W4A8QuantInfo(MoeQuantInfo):
-    w13_weight: torch.Tensor
-    w2_weight: torch.Tensor
-    w13_weight_scale: torch.Tensor
-    w2_weight_scale: torch.Tensor
+    w13_weight: Optional[torch.Tensor]
+    w2_weight: Optional[torch.Tensor]
+    w13_weight_scale: Optional[torch.Tensor]
+    w2_weight_scale: Optional[torch.Tensor]
     w13_weight_scale_e8m0: Optional[torch.Tensor] = None
     w2_weight_scale_e8m0: Optional[torch.Tensor] = None
+    humming_w13_weight: Optional[Any] = None
+    humming_w2_weight: Optional[Any] = None
     swiglu_limit: Optional[float] = None
+
+    def has_humming_weights(self) -> bool:
+        return self.humming_w13_weight is not None or self.humming_w2_weight is not None
 
 
 _E2M1_VALUES = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -119,6 +124,15 @@ def _mxfp4_w4a8_deepep_ll_reference(
     masked_m: torch.Tensor,
     quant_info: Mxfp4W4A8QuantInfo,
 ) -> torch.Tensor:
+    if (
+        quant_info.w13_weight is None
+        or quant_info.w2_weight is None
+        or quant_info.w13_weight_scale is None
+        or quant_info.w2_weight_scale is None
+    ):
+        raise NotImplementedError(
+            "MXFP4 W4A8 reference path requires original MXFP4 weights."
+        )
     compute_dtype = torch.bfloat16
     output = torch.zeros_like(hidden_states, dtype=compute_dtype)
     hidden_states_bf16 = _dequant_deepep_activation(
@@ -157,6 +171,15 @@ def _can_use_triton_path(
     hidden_states_scale: Optional[torch.Tensor],
     quant_info: Mxfp4W4A8QuantInfo,
 ) -> bool:
+    if quant_info.has_humming_weights():
+        return False
+    if (
+        quant_info.w13_weight is None
+        or quant_info.w2_weight is None
+        or quant_info.w13_weight_scale is None
+        or quant_info.w2_weight_scale is None
+    ):
+        return False
     if os.environ.get("SGLANG_MXFP4_W4A8_REFERENCE", "0") == "1":
         return False
     if hidden_states_scale is None:
@@ -226,14 +249,27 @@ def _mxfp4_w4a8_deepep_normal(
         raise NotImplementedError(
             "mxfp4_w4a8 DeepEP normal path does not support swiglu_limit yet."
         )
-    if quant_info.w13_weight_scale.dtype != torch.float32:
-        raise NotImplementedError(
-            "mxfp4_w4a8 DeepEP normal path requires float32 w13 scales."
-        )
-    if quant_info.w2_weight_scale.dtype != torch.float32:
-        raise NotImplementedError(
-            "mxfp4_w4a8 DeepEP normal path requires float32 w2 scales."
-        )
+    use_humming = quant_info.has_humming_weights()
+    if use_humming and (
+        quant_info.humming_w13_weight is None or quant_info.humming_w2_weight is None
+    ):
+        raise RuntimeError("Humming MXFP4 W4A8 requires both w13 and w2 weights.")
+    if not use_humming:
+        if (
+            quant_info.w13_weight is None
+            or quant_info.w2_weight is None
+            or quant_info.w13_weight_scale is None
+            or quant_info.w2_weight_scale is None
+        ):
+            raise RuntimeError("MXFP4 W4A8 Triton path requires original weights.")
+        if quant_info.w13_weight_scale.dtype != torch.float32:
+            raise NotImplementedError(
+                "mxfp4_w4a8 DeepEP normal path requires float32 w13 scales."
+            )
+        if quant_info.w2_weight_scale.dtype != torch.float32:
+            raise NotImplementedError(
+                "mxfp4_w4a8 DeepEP normal path requires float32 w2 scales."
+            )
     max_tokens_per_expert = max(num_recv_tokens_per_expert)
 
     device = hidden_states.device
@@ -303,21 +339,36 @@ def _mxfp4_w4a8_deepep_normal(
         )
         del input_tensor_bf16
 
-    from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
-        mxfp4_w4a8_deepep_normal_triton,
-    )
+    if use_humming:
+        from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+            mxfp4_w4a8_deepep_normal_humming,
+        )
 
-    down_output = mxfp4_w4a8_deepep_normal_triton(
-        input_tensor,
-        input_tensor_scale,
-        expert_start,
-        num_tokens_per_expert_gpu,
-        quant_info.w13_weight,
-        quant_info.w2_weight,
-        quant_info.w13_weight_scale,
-        quant_info.w2_weight_scale,
-        max_tokens_per_expert=max_tokens_per_expert,
-    )
+        down_output = mxfp4_w4a8_deepep_normal_humming(
+            input_tensor,
+            input_tensor_scale,
+            expert_start,
+            num_tokens_per_expert_gpu,
+            quant_info.humming_w13_weight,
+            quant_info.humming_w2_weight,
+            max_tokens_per_expert=max_tokens_per_expert,
+        )
+    else:
+        from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+            mxfp4_w4a8_deepep_normal_triton,
+        )
+
+        down_output = mxfp4_w4a8_deepep_normal_triton(
+            input_tensor,
+            input_tensor_scale,
+            expert_start,
+            num_tokens_per_expert_gpu,
+            quant_info.w13_weight,
+            quant_info.w2_weight,
+            quant_info.w13_weight_scale,
+            quant_info.w2_weight_scale,
+            max_tokens_per_expert=max_tokens_per_expert,
+        )
 
     output = torch.empty(
         hidden_states.shape,
@@ -355,7 +406,34 @@ def fused_experts_deepep_to_mxfp4_w4a8(
             "mxfp4_w4a8 requires DeepEP FP8 dispatch output. "
             "Start the server with --deepep-dispatcher-output-dtype fp8."
         )
-    if _can_use_triton_path(hidden_states_scale, quant_info):
+    if quant_info.has_humming_weights():
+        if (
+            quant_info.humming_w13_weight is None
+            or quant_info.humming_w2_weight is None
+        ):
+            raise RuntimeError("Humming MXFP4 W4A8 requires both w13 and w2 weights.")
+        if quant_info.swiglu_limit is not None:
+            raise NotImplementedError(
+                "mxfp4_w4a8 Humming low-latency path does not support "
+                "swiglu_limit yet."
+            )
+        if hidden_states_scale is None:
+            raise NotImplementedError(
+                "mxfp4_w4a8 Humming low-latency path requires FP8 scales."
+            )
+        from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
+            mxfp4_w4a8_deepep_ll_humming,
+        )
+
+        output = mxfp4_w4a8_deepep_ll_humming(
+            hidden_states,
+            hidden_states_scale,
+            masked_m,
+            topk_ids.shape[0],
+            quant_info.humming_w13_weight,
+            quant_info.humming_w2_weight,
+        )
+    elif _can_use_triton_path(hidden_states_scale, quant_info):
         from sglang.srt.layers.moe.moe_runner.mxfp4_w4a8_deepep_triton import (
             mxfp4_w4a8_deepep_ll_triton,
         )
