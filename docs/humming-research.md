@@ -450,6 +450,100 @@ stage3 后重新采集单 kernel NCU：
 - 寄存器仍在 `252-255/thread`，occupancy 仍约 `12%`，说明下一层瓶颈还是 register pressure / local+shared transaction / scale apply，而不是 HBM。
 - 这轮是小幅但稳定的 kernel-level tuning 收益；端到端是否能继续从 `2.2w tokens/s` 上涨，需要再跑真实 prefill profile。
 
+## 2026-06-16 追加：Humming 源码级候选试验
+
+在不继续回写 SGLang 的前提下，单独对 Humming kernel 做了两类试验：
+
+1. 隔离进程扫描 `BM/WN/stages3` 候选，避免非法 kernel 污染 CUDA context。
+2. 临时修改 Humming epilogue，放宽 `num_write_splits=2` 对 `BM48` 的限制，验证是否能降低写回压力。
+
+隔离扫描结果显示，当前选择仍是最优：
+
+| shape | best isolated config | mean latency | 次优配置 | 次优 latency |
+| --- | --- | ---: | --- | ---: |
+| w13-like 16k | `BM48/BN128/BK128/WN32/stages3` | `2.453 ms` | `BM40/WN32/stages3` | `2.599 ms` |
+| w2-like 16k | `BM48/BN128/BK128/WN32/stages3` | `1.347 ms` | `BM56/WN32/stages3` | `1.405 ms` |
+
+部分非标准 tile 会触发非法指令，所以后续扫配置必须继续使用单候选独立进程；不要把所有候选放在一个 Python 进程里顺序跑。
+
+`num_write_splits=2` 源码试验：
+
+- 修改点：临时把 Humming epilogue 里 `BlockShape::M % 32 == 0` 放宽到 `BlockShape::M % 16 == 0`，使 `BM48` 可以编译 split2。
+- 正确性：w13/w2 都能 `allclose_1e-2=true`。
+- 性能：
+  - w13 `split1=2.456 ms`，`split2=2.459 ms`，基本持平略慢。
+  - w2 `split1=1.346 ms`，`split2=1.339 ms`，约 `0.5%` 小收益。
+- 结论：收益太小，不值得保留 Humming 源码改动；试验后已回滚 Humming 源码。
+
+当前 Humming 源码级结论：
+
+- 继续单纯调整 `BM/WN/stages/ctas/num_sms/split` 的收益已经接近尾声。
+- 主要瓶颈仍是 `252-255 regs/thread` 带来的低 occupancy，以及 scale apply / epilogue / shared-local transaction。
+- 如果还要继续从 kernel 内部拿明显收益，需要深入改 `mainloop_arith.cuh` 的 scale 处理或 `epilogue` 的 register footprint，而不是只改 tuning config。
+
+## 2026-06-16 追加：DeepGEMM PR 332 评估
+
+用户提到 DeepGEMM PR 332：`https://github.com/deepseek-ai/DeepGEMM/pull/332`。本地已拉取到：
+
+```text
+/sgl-workspace/DeepGEMM-pr332
+```
+
+PR 里和当前问题相关的文件：
+
+- `csrc/jit_kernels/impls/sm90_fp8_fp4_gemm_1d2d.hpp`
+- `csrc/jit_kernels/impls/sm90_fp8_fp4_gemm_1d2d_rs.hpp`
+- `tests/test_sm90_fp8_fp4.py`
+- `csrc/apis/gemm.hpp`
+
+本地构建情况：
+
+- PR head 可拉取并编译 Python 扩展。
+- 因网络问题，CUTLASS submodule 没有完整拉下来；临时使用系统已有 `/usr/local/lib/python3.12/dist-packages/deep_gemm/include` 作为 CUTLASS/CuTe include。
+- `deep_gemm` import 成功，且暴露：
+  - `m_grouped_fp8_fp4_gemm_nt_contiguous_sm90_fused_wgmma`
+  - `m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma`
+
+自带测试结果：
+
+- `test_sm90_fp8_fp4_contiguous` 可通过。
+- `test_sm90_fp8_fp4_masked` 可通过。
+- 但测试表里 W4 路径在这些 synthetic case 下比 DeepGEMM 自己的 FP8 对照慢，例如 contiguous `groups=8,m/group=128,n=4096,k=7168`：
+  - W4：`190 us`
+  - FP8：`86 us`
+  - speedup：`0.45x`
+- masked case 也类似，W4 通常是 FP8 的 `0.4x-0.8x`。
+
+和当前 SGLang/Humming 场景的关键差异：
+
+1. DeepGEMM contiguous API 使用 `grouped_layout`，它是每个 token 的 group id，形状接近 `[M]`。
+   - 当前 Humming/SGLang normal path 使用 expert prefix layout，形状是 `[E + 1]`。
+   - 如果直接接 DeepGEMM，需要额外构造 `[M]` layout，16k prefill 下是可接受的，但每层/每 launch 都会多一份 layout 读写。
+
+2. DeepGEMM PR 的 FP4 scale 语义和当前 SGLang MXFP4 W4A8 不一致。
+   - PR 测试里 `per_token_cast_to_fp4(..., use_ue8m0=True)`，并支持 E8M0/direct scale fast path。
+   - 当前 SGLang 权重 scale 是 float32 `[E, N, K/32]`，Humming 接入时转成 bf16 scale。
+   - 之前直接把 SGLang float32 scale cast 到 E8M0 已验证会严重错，不能作为 drop-in。
+
+3. 在 SGLang 目标形状上直接跑 DeepGEMM PR 的 grouped contiguous synthetic case，数值偏差明显大于 Humming 路径：
+   - w13-like `groups=48,m/group=341,N=4096,K=6144`：`w4_diff≈0.273`。
+   - w2-like `groups=48,m/group=341,N=6144,K=2048`：`w4_diff≈0.273`。
+   - 这说明 PR 的量化/scale 语义不能直接对齐当前 MXFP4 W4A8 reference。
+
+可参考点：
+
+- PR 的 SM90 1d2d grouped FP8xFP4 kernel 已经把 contiguous/masked FP4 WGMMA 路径串起来，可作为 scheduler 和 TMA/SFA/SFB layout 参考。
+- 它允许 `block_m_override/block_n_override` 做 block shape sweep，这一点可借鉴到 Humming/SGLang 的 tuning harness。
+- PR 的 1d2d psum scheduler 对 grouped contiguous 的处理值得阅读，但不能直接替换 Humming，因为输入 layout 和 scale 约定不同。
+
+结论：
+
+- DeepGEMM PR 332 可以参考，但当前不适合作为 SGLang MXFP4 W4A8 prefill normal path 的直接替换。
+- 若要采用，需要至少解决两件事：
+  1. 把 SGLang `expert_start/counts` 转换或改造成 DeepGEMM 所需的 per-token `grouped_layout`。
+  2. 重新对齐 MXFP4 scale 语义，支持当前 float32/bf16 per-32K per-N scale，而不是直接走 UE8M0 fast path。
+- 短期继续沿 Humming 路径优化更现实；DeepGEMM PR 主要作为源码设计参考。
+
 建议下一步优先级：
 
 1. 在空闲 GPU 上完整复测 focused tuning，尤其是 `use_stream_k=false`、`num_write_splits=2`、`BM48 vs BM64`、`stages=3/4/5` 的组合。

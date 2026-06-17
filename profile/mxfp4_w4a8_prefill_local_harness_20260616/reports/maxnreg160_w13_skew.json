@@ -1,0 +1,78 @@
+{
+  "shape": {
+    "name": "w13",
+    "n": 4096,
+    "k": 6144
+  },
+  "total_m": 16384,
+  "num_experts": 48,
+  "distribution": "skew",
+  "scale_mode": "float",
+  "counts": {
+    "min": 1,
+    "max": 872,
+    "mean": 341.3333333333333,
+    "nonzero": 48
+  },
+  "baseline_meta": {
+    "block_m": 64,
+    "block_n": 128,
+    "dot_k": 32,
+    "num_warps": 4,
+    "num_stages": 3
+  },
+  "baseline_grid": [
+    48,
+    14,
+    32
+  ],
+  "baseline_direct_check": {
+    "max_abs_err": 0.0,
+    "mean_abs_err": 0.0,
+    "max_rel_err": 0.0,
+    "mean_rel_err": 0.0,
+    "allclose_1e-2": true
+  },
+  "baseline_latency": {
+    "mean_ms": 6.5213727951049805,
+    "p50_ms": 6.518735885620117,
+    "p90_ms": 6.529888153076172,
+    "p99_ms": 6.532991886138916,
+    "min_ms": 6.514431953430176,
+    "max_ms": 6.532991886138916
+  },
+  "candidates": [
+    {
+      "meta": {
+        "block_m": 64,
+        "block_n": 128,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "variant": "baseline",
+      "maxnreg": 160,
+      "grid": [
+        48,
+        14,
+        32
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 6.321823978424073,
+        "p50_ms": 6.313807964324951,
+        "p90_ms": 6.338304042816162,
+        "p99_ms": 6.366943836212158,
+        "min_ms": 6.30511999130249,
+        "max_ms": 6.366943836212158
+      },
+      "speedup_vs_baseline_mean": 1.0315650700433852
+    }
+  ]
+}

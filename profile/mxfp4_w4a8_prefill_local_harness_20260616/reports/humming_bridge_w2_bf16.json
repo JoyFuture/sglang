@@ -1,0 +1,217 @@
+{
+  "shape": {
+    "name": "w2",
+    "n": 6144,
+    "k": 2048
+  },
+  "total_m": 16384,
+  "num_experts": 48,
+  "distribution": "skew",
+  "counts": {
+    "min": 1,
+    "max": 872,
+    "mean": 341.3333333333333,
+    "stdev": 265.9589045113716,
+    "nonzero": 48
+  },
+  "b_scale_dtype": "bf16",
+  "triton_baseline_latency": {
+    "mean_ms": 3.061084818840027,
+    "p50_ms": 3.060159921646118,
+    "p90_ms": 3.0650880336761475,
+    "p99_ms": 3.0668160915374756,
+    "min_ms": 3.056864023208618,
+    "max_ms": 3.0668160915374756
+  },
+  "humming_latency": {
+    "mean_ms": 1.6855231881141663,
+    "p50_ms": 1.6845600008964539,
+    "p90_ms": 1.6908479928970337,
+    "p99_ms": 1.713312029838562,
+    "min_ms": 1.6733119487762451,
+    "max_ms": 1.713312029838562
+  },
+  "speedup_vs_triton_mean": 1.816103652815893,
+  "correctness": {
+    "max_abs_err": 0.009368896484375,
+    "mean_abs_err": 7.22033109923359e-06,
+    "max_rel_err": 2639.674560546875,
+    "mean_rel_err": 0.010663405060768127,
+    "allclose_1e-2": true
+  },
+  "humming_tuning_config": [
+    [
+      0,
+      2,
+      {
+        "block_shape": [
+          8,
+          128,
+          128
+        ],
+        "warp_shape": [
+          8,
+          16,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1
+      }
+    ],
+    [
+      2,
+      264,
+      {
+        "block_shape": [
+          8,
+          128,
+          128
+        ],
+        "warp_shape": [
+          8,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      264,
+      608,
+      {
+        "block_shape": [
+          16,
+          128,
+          128
+        ],
+        "warp_shape": [
+          16,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      608,
+      1376,
+      {
+        "block_shape": [
+          32,
+          128,
+          128
+        ],
+        "warp_shape": [
+          32,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      1376,
+      2048,
+      {
+        "block_shape": [
+          48,
+          128,
+          128
+        ],
+        "warp_shape": [
+          48,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      2048,
+      2752,
+      {
+        "block_shape": [
+          64,
+          128,
+          128
+        ],
+        "warp_shape": [
+          64,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      2752,
+      4096,
+      {
+        "block_shape": [
+          48,
+          128,
+          128
+        ],
+        "warp_shape": [
+          48,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      4096,
+      1073741824,
+      {
+        "block_shape": [
+          64,
+          128,
+          128
+        ],
+        "warp_shape": [
+          64,
+          16,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2
+      }
+    ]
+  ],
+  "triton_grid": [
+    48,
+    14,
+    48
+  ]
+}

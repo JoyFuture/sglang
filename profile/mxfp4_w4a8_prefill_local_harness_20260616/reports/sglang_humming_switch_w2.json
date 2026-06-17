@@ -1,0 +1,45 @@
+{
+  "shape": {
+    "name": "w2",
+    "n": 6144,
+    "k": 2048
+  },
+  "total_m": 16384,
+  "num_experts": 48,
+  "distribution": "skew",
+  "scale_mode": "float",
+  "counts": {
+    "min": 1,
+    "max": 872,
+    "mean": 341.3333333333333,
+    "nonzero": 48
+  },
+  "baseline_meta": {
+    "block_m": 64,
+    "block_n": 128,
+    "dot_k": 32,
+    "num_warps": 4,
+    "num_stages": 3
+  },
+  "baseline_grid": [
+    48,
+    14,
+    48
+  ],
+  "baseline_direct_check": {
+    "max_abs_err": 0.00727081298828125,
+    "mean_abs_err": 7.233165433717659e-06,
+    "max_rel_err": 1541.4859619140625,
+    "mean_rel_err": 0.010667668655514717,
+    "allclose_1e-2": true
+  },
+  "baseline_latency": {
+    "mean_ms": 1.7727183997631073,
+    "p50_ms": 1.7364799976348877,
+    "p90_ms": 1.9480960369110107,
+    "p99_ms": 1.9563519954681396,
+    "min_ms": 1.6933759450912476,
+    "max_ms": 1.9563519954681396
+  },
+  "candidates": []
+}

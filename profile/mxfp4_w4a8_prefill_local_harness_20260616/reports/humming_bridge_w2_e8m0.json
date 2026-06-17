@@ -1,0 +1,259 @@
+{
+  "shape": {
+    "name": "w2",
+    "n": 6144,
+    "k": 2048
+  },
+  "total_m": 16384,
+  "num_experts": 48,
+  "distribution": "skew",
+  "counts": {
+    "min": 1,
+    "max": 872,
+    "mean": 341.3333333333333,
+    "stdev": 265.9589045113716,
+    "nonzero": 48
+  },
+  "b_scale_dtype": "e8m0",
+  "triton_baseline_latency": {
+    "mean_ms": 5.423696041107178,
+    "p50_ms": 5.506240129470825,
+    "p90_ms": 5.513216018676758,
+    "p99_ms": 5.51964807510376,
+    "min_ms": 5.156896114349365,
+    "max_ms": 5.51964807510376
+  },
+  "humming_latency": {
+    "mean_ms": 0.6654944002628327,
+    "p50_ms": 0.6654079854488373,
+    "p90_ms": 0.6665599942207336,
+    "p99_ms": 0.6677119731903076,
+    "min_ms": 0.6640959978103638,
+    "max_ms": 0.6677119731903076
+  },
+  "speedup_vs_triton_mean": 8.149874798293006,
+  "correctness": {
+    "max_abs_err": 2.2802734375,
+    "mean_abs_err": 0.30126768350601196,
+    "max_rel_err": 730469.6875,
+    "mean_rel_err": 251.35931396484375,
+    "allclose_1e-2": false
+  },
+  "humming_tuning_config": [
+    [
+      0,
+      1,
+      {
+        "block_shape": [
+          8,
+          128,
+          256
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 128,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1
+      }
+    ],
+    [
+      1,
+      2,
+      {
+        "block_shape": [
+          8,
+          128,
+          256
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 1
+      }
+    ],
+    [
+      2,
+      4,
+      {
+        "block_shape": [
+          8,
+          128,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 2
+      }
+    ],
+    [
+      4,
+      264,
+      {
+        "block_shape": [
+          8,
+          128,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      264,
+      608,
+      {
+        "block_shape": [
+          16,
+          128,
+          128
+        ],
+        "warp_shape": [
+          16,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      608,
+      1376,
+      {
+        "block_shape": [
+          32,
+          128,
+          128
+        ],
+        "warp_shape": [
+          32,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 5,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      1376,
+      2048,
+      {
+        "block_shape": [
+          48,
+          128,
+          128
+        ],
+        "warp_shape": [
+          48,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      2048,
+      2752,
+      {
+        "block_shape": [
+          64,
+          128,
+          128
+        ],
+        "warp_shape": [
+          64,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      2752,
+      4096,
+      {
+        "block_shape": [
+          48,
+          128,
+          128
+        ],
+        "warp_shape": [
+          48,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 3
+      }
+    ],
+    [
+      4096,
+      1073741824,
+      {
+        "block_shape": [
+          64,
+          128,
+          128
+        ],
+        "warp_shape": [
+          64,
+          32,
+          128
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 3
+      }
+    ]
+  ],
+  "triton_grid": [
+    48,
+    14,
+    48
+  ]
+}

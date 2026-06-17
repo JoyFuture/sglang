@@ -1,0 +1,195 @@
+{
+  "shape": {
+    "name": "w13",
+    "n": 4096,
+    "k": 6144
+  },
+  "total_m": 16384,
+  "num_experts": 48,
+  "distribution": "skew",
+  "counts": {
+    "min": 1,
+    "max": 872,
+    "mean": 341.3333333333333,
+    "nonzero": 48
+  },
+  "baseline_meta": {
+    "block_m": 64,
+    "block_n": 128,
+    "dot_k": 32,
+    "num_warps": 4,
+    "num_stages": 3
+  },
+  "baseline_grid": [
+    48,
+    14,
+    32
+  ],
+  "baseline_direct_check": {
+    "max_abs_err": 0.0,
+    "mean_abs_err": 0.0,
+    "max_rel_err": 0.0,
+    "mean_rel_err": 0.0,
+    "allclose_1e-2": true
+  },
+  "baseline_latency": {
+    "mean_ms": 6.587461392084758,
+    "p50_ms": 6.586608171463013,
+    "p90_ms": 6.598368167877197,
+    "p99_ms": 6.598368167877197,
+    "min_ms": 6.5753278732299805,
+    "max_ms": 6.598368167877197
+  },
+  "candidates": [
+    {
+      "meta": {
+        "block_m": 32,
+        "block_n": 128,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "grid": [
+        48,
+        28,
+        32
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 11.904714584350586,
+        "p50_ms": 11.903247833251953,
+        "p90_ms": 11.916704177856445,
+        "p99_ms": 11.916704177856445,
+        "min_ms": 11.899104118347168,
+        "max_ms": 11.916704177856445
+      },
+      "speedup_vs_baseline_mean": 0.5533489564499383
+    },
+    {
+      "meta": {
+        "block_m": 64,
+        "block_n": 64,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "grid": [
+        48,
+        14,
+        64
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 11.904288132985434,
+        "p50_ms": 11.903327941894531,
+        "p90_ms": 11.92080020904541,
+        "p99_ms": 11.92080020904541,
+        "min_ms": 11.89299201965332,
+        "max_ms": 11.92080020904541
+      },
+      "speedup_vs_baseline_mean": 0.5533687792579255
+    },
+    {
+      "meta": {
+        "block_m": 32,
+        "block_n": 64,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "grid": [
+        48,
+        28,
+        64
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 9.72601064046224,
+        "p50_ms": 9.724559783935547,
+        "p90_ms": 9.731552124023438,
+        "p99_ms": 9.731552124023438,
+        "min_ms": 9.722271919250488,
+        "max_ms": 9.731552124023438
+      },
+      "speedup_vs_baseline_mean": 0.6773035353960585
+    },
+    {
+      "meta": {
+        "block_m": 16,
+        "block_n": 128,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "grid": [
+        48,
+        55,
+        32
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 16.538256009419758,
+        "p50_ms": 16.53559970855713,
+        "p90_ms": 16.556224822998047,
+        "p99_ms": 16.556224822998047,
+        "min_ms": 16.528703689575195,
+        "max_ms": 16.556224822998047
+      },
+      "speedup_vs_baseline_mean": 0.3983165690706875
+    },
+    {
+      "meta": {
+        "block_m": 64,
+        "block_n": 256,
+        "dot_k": 32,
+        "num_warps": 4,
+        "num_stages": 3
+      },
+      "grid": [
+        48,
+        14,
+        16
+      ],
+      "correctness": {
+        "max_abs_err": 0.0,
+        "mean_abs_err": 0.0,
+        "max_rel_err": 0.0,
+        "mean_rel_err": 0.0,
+        "allclose_1e-2": true
+      },
+      "latency": {
+        "mean_ms": 9.2488161722819,
+        "p50_ms": 9.251823902130127,
+        "p90_ms": 9.285280227661133,
+        "p99_ms": 9.285280227661133,
+        "min_ms": 9.199968338012695,
+        "max_ms": 9.285280227661133
+      },
+      "speedup_vs_baseline_mean": 0.7122491429580956
+    }
+  ]
+}
