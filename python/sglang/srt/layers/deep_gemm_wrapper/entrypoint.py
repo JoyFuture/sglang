@@ -88,6 +88,8 @@ def grouped_gemm_nt_f8fp4bf16_masked(
     gran_k_b: int = 32,
     recipe_a: Optional[Tuple[int, int]] = None,
     recipe_b: Optional[Tuple[int, int]] = None,
+    masked_m_max_hint: Optional[int] = None,
+    active_groups_hint: Optional[int] = None,
 ):
     if overlap_args is not None:
         raise RuntimeError("SM90 FP8xFP4 masked DeepGEMM does not support overlap yet")
@@ -130,6 +132,8 @@ def grouped_gemm_nt_f8fp4bf16_masked(
             gran_k=gran_k_a,
             gran_k_a=gran_k_a,
             gran_k_b=gran_k_b,
+            masked_m_max_hint=masked_m_max_hint,
+            active_groups_hint=active_groups_hint,
         )
 
 

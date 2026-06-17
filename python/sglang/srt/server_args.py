@@ -3520,6 +3520,20 @@ class ServerArgs:
             )
 
         if self.moe_a2a_backend == "deepep":
+            if (
+                self.moe_runner_backend == "deep_gemm"
+                and self.quantization == "fp8"
+                and self.deepep_mode == "auto"
+            ):
+                from sglang.srt.configs.model_config import is_mimo_v2_mxfp4_experts
+
+                hf_config = self.get_model_config().hf_config
+                if hf_config is not None and is_mimo_v2_mxfp4_experts(hf_config):
+                    self.deepep_mode = "low_latency"
+                    logger.warning(
+                        "MiMoV2 MXFP4 experts with DeepGEMM use the FP8xFP4 "
+                        "masked DeepEP path; auto set --deepep-mode=low_latency."
+                    )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
                 self.disable_cuda_graph = True
