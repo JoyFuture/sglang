@@ -371,6 +371,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
         expected_m = runner_input.expected_m
+        is_fp4_experts = quant_info.is_fp4_experts
 
         w13_weight = quant_info.w13_weight
         w2_weight = quant_info.w2_weight
@@ -403,7 +404,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         gateup_output = torch.empty(
             (num_groups, m, n), device=hidden_states_device, dtype=torch.bfloat16
         )
-        deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        gateup_gemm = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked
+            if is_fp4_experts
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked
+        )
+        gateup_gemm(
             (hidden_states, hidden_states_scale),
             (w13_weight, w13_scale),
             gateup_output,
@@ -463,7 +469,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         )
 
         down_gemm_overlap_args = running_state.get("down_gemm_overlap_args", None)
-        if down_gemm_overlap_args is None:
+        if down_gemm_overlap_args is None or is_fp4_experts:
             gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
@@ -475,7 +481,12 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 "max_block_n": max_block_n,
             }
 
-        deep_gemm_return_value = deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked(
+        down_gemm = (
+            deep_gemm_wrapper.grouped_gemm_nt_f8fp4bf16_masked
+            if is_fp4_experts
+            else deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_masked
+        )
+        deep_gemm_return_value = down_gemm(
             (down_input, down_input_scale),
             (w2_weight, w2_scale),
             down_output,

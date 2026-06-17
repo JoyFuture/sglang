@@ -77,6 +77,62 @@ def grouped_gemm_nt_f8f8bf16_masked(
             )
 
 
+def grouped_gemm_nt_f8fp4bf16_masked(
+    lhs: Tuple[torch.Tensor, torch.Tensor],
+    rhs: Tuple[torch.Tensor, torch.Tensor],
+    out: torch.Tensor,
+    masked_m: torch.Tensor,
+    expected_m: int,
+    overlap_args: Optional[Any] = None,
+    gran_k_a: int = 128,
+    gran_k_b: int = 32,
+    recipe_a: Optional[Tuple[int, int]] = None,
+    recipe_b: Optional[Tuple[int, int]] = None,
+):
+    if overlap_args is not None:
+        raise RuntimeError("SM90 FP8xFP4 masked DeepGEMM does not support overlap yet")
+
+    kernel = getattr(
+        deep_gemm,
+        "m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma",
+        None,
+    )
+    if kernel is None:
+        raise RuntimeError(
+            "DeepGEMM does not expose "
+            "m_grouped_fp8_fp4_gemm_nt_masked_sm90_fused_wgmma; "
+            "install DeepGEMM with deepseek-ai/DeepGEMM#332 or newer."
+        )
+    if recipe_a is not None:
+        gran_k_a = recipe_a[1]
+    if recipe_b is not None:
+        gran_k_b = recipe_b[1]
+
+    num_groups, _, k = lhs[0].shape
+    _, n, _ = rhs[0].shape
+    kernel_type = compile_utils.DeepGemmKernelType.GROUPED_GEMM_NT_F8FP4BF16_MASKED
+
+    _sanity_check_input(lhs)
+    _sanity_check_input(rhs)
+
+    lhs = _ensure_cuda(lhs)
+    rhs = _ensure_cuda(rhs)
+
+    with compile_utils.deep_gemm_execution_hook(
+        expected_m, n, k, num_groups, kernel_type
+    ):
+        return kernel(
+            lhs,
+            rhs,
+            out,
+            masked_m,
+            expected_m,
+            gran_k=gran_k_a,
+            gran_k_a=gran_k_a,
+            gran_k_b=gran_k_b,
+        )
+
+
 def _ensure_cuda(
     pair: Tuple[torch.Tensor, torch.Tensor],
 ) -> Tuple[torch.Tensor, torch.Tensor]:

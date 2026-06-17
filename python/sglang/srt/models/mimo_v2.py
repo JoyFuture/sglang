@@ -276,6 +276,7 @@ class MiMoV2MoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=1.0,
             apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk,
+            is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             # Some Fp4 MoE backends require the output format to be bypassed but the MTP layers are unquantized
             # and requires the output format to be standard. We use quant_config to determine the output format.
             output_format=TopKOutputFormat.STANDARD if quant_config is None else None,
@@ -1270,6 +1271,36 @@ class MiMoV2ForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         skipped_mtp_weights = False
 
+        def _resolve_expert_param_name(name: str) -> Optional[str]:
+            if name in params_dict:
+                return name
+
+            if name.endswith("_weight_scale"):
+                scale_inv_name = f"{name}_inv"
+                if scale_inv_name in params_dict:
+                    return scale_inv_name
+
+            return None
+
+        def _maybe_decode_mxfp4_scale(
+            name: str, param: torch.nn.Parameter, loaded_weight: torch.Tensor
+        ) -> torch.Tensor:
+            if (
+                not name.endswith("_weight_scale_inv")
+                or loaded_weight.dtype != torch.uint8
+                or not getattr(self.quant_config, "is_fp4_experts", False)
+            ):
+                return loaded_weight
+
+            e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+            if e8m0_dtype is None or param.dtype == torch.uint8:
+                return loaded_weight
+            if param.dtype == e8m0_dtype:
+                return loaded_weight.contiguous().view(e8m0_dtype)
+            if param.dtype in (torch.float32, torch.float16, torch.bfloat16):
+                return loaded_weight.contiguous().view(e8m0_dtype).to(dtype=param.dtype)
+            return loaded_weight
+
         def _is_vision_audio_weight(name):
             return (
                 name.startswith(self._VISION_AUDIO_WEIGHT_PREFIXES)
@@ -1452,7 +1483,15 @@ class MiMoV2ForCausalLM(nn.Module):
                     if weight_name not in name:
                         continue
                     name = name.replace(weight_name, param_name)
+                    resolved_name = _resolve_expert_param_name(name)
+                    if resolved_name is None:
+                        logger.warning(f"Parameter {name} not found in params_dict")
+                        continue
+                    name = resolved_name
                     param = params_dict[name]
+                    loaded_weight = _maybe_decode_mxfp4_scale(
+                        name, param, loaded_weight
+                    )
                     weight_loader = param.weight_loader
                     weight_loader(
                         param,
