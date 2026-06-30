@@ -113,9 +113,10 @@ def _can_allocate_humming_normal_entry(
         )
 
     free_bytes, _ = torch.cuda.mem_get_info(b_packed.device)
-    # Humming keeps an offline-repacked weight copy and a bf16 scale copy.
+    # Humming keeps an offline-repacked weight copy and an E8M0 scale copy.
     # During transform there is another transient scale layout copy, so keep
     # a conservative margin to avoid crashing a nearly full serving process.
+    # (b_scale is E8M0/uint8 at 1 byte/elem; *4 stays as a safe upper bound.)
     required_bytes = b_packed.nbytes + b_scale.numel() * 4 + 256 * 1024 * 1024
     if free_bytes < required_bytes:
         return _handle_humming_unavailable(
@@ -941,6 +942,78 @@ def _mxfp4_w4a8_grouped_gemm_contig_dot_scaled_aligned_nk_kernel(
     )
 
 
+_HUMMING_FUSED_E8M0_PATCHED = False
+
+
+def _patch_humming_disable_fused_e8m0() -> None:
+    """Make Humming skip its automatic fp8xfp4xe8m0 -> fused-E8M0 promotion.
+
+    Humming's ``HummingLayerMeta.__post_init__`` auto-selects the *fused*-E8M0
+    kernel whenever (a_dtype fp8/int8, fp4 weight, e8m0 weight scale, grouped
+    weight scale). That fused path does NOT support per-token-group input scale
+    (only a single per-tensor global scale), so with our DeepEP per-token-group
+    -128 FP8 activations it silently miscomputes (garbage tokens). The non-fused
+    group-scale mainloop natively supports per-group input scale while still
+    consuming the 1-byte E8M0 weight scale.
+
+    To keep this entirely on the SGLang side (no Humming source edits) we wrap
+    ``HummingLayerMeta.__post_init__``: when SGLANG_HUMMING_DISABLE_FUSED_E8M0 is
+    enabled (default), we pre-seed ``use_fused_e8m0_scale = False`` and let the
+    original run; the original's auto-promotion is guarded by
+    ``if not self.use_fused_e8m0_scale: self.use_fused_e8m0_scale = (...)``, so we
+    cannot simply pre-set it. Instead we run the original, then -- if it promoted
+    a meta that we want non-fused -- rebuild a fresh meta with the promotion
+    suppressed. The rebuild path is exercised only for the exact dtype combo, so
+    every other Humming layer is byte-for-byte unaffected.
+
+    Idempotent and gated on SGLANG_HUMMING_DISABLE_FUSED_E8M0 (default "1").
+    """
+    global _HUMMING_FUSED_E8M0_PATCHED
+    if _HUMMING_FUSED_E8M0_PATCHED:
+        return
+
+    import dataclasses
+
+    from humming import dtypes as _hd
+    from humming.config import WeightScaleType
+    from humming.layer import HummingLayerMeta
+
+    _orig_post_init = HummingLayerMeta.__post_init__
+    _sentinel = "_sglang_force_nonfused_e8m0"
+
+    def _patched_post_init(self):
+        disable = os.environ.get("SGLANG_HUMMING_DISABLE_FUSED_E8M0", "1") != "0"
+        # Re-entry guard: when we re-run __post_init__ on a clone (see below) we
+        # must not recurse; the clone carries the sentinel so the original runs
+        # verbatim with fused promotion already disabled.
+        forced = getattr(self, _sentinel, False)
+        _orig_post_init(self)
+        if not disable or forced:
+            return
+        # Only intervene for the exact dtype combo Humming auto-promotes to fused.
+        would_promote = (
+            self.use_fused_e8m0_scale
+            and self.a_dtype in [_hd.float8e4m3, _hd.int8]
+            and self.weight_scale_group_size > 0
+            and self.b_dtype in [_hd.float4e2m1]
+            and self.bs_dtype in [_hd.float8e8m0]
+        )
+        if not would_promote:
+            return
+        # Undo the fused promotion in place (the instance is frozen after
+        # __post_init__ sets _meta_str, so bypass __setattr__ and refresh the
+        # cached fields the promotion touched).
+        object.__setattr__(self, "use_fused_e8m0_scale", False)
+        object.__setattr__(self, "weight_scale_type", WeightScaleType.GROUP)
+        object.__setattr__(self, "is_tensor_weight_scale", False)
+        object.__delattr__(self, "_meta_str")
+        object.__setattr__(self, _sentinel, True)
+        object.__setattr__(self, "_meta_str", self.to_str())
+
+    HummingLayerMeta.__post_init__ = _patched_post_init
+    _HUMMING_FUSED_E8M0_PATCHED = True
+
+
 def _import_humming():
     humming_root = os.environ.get("SGLANG_HUMMING_ROOT")
     if humming_root and humming_root not in sys.path:
@@ -955,6 +1028,7 @@ def _import_humming():
             "SGLANG_MXFP4_W4A8_USE_HUMMING_NORMAL=1 requires Humming to be "
             "importable. Set PYTHONPATH or SGLANG_HUMMING_ROOT to the Humming repo."
         ) from exc
+    _patch_humming_disable_fused_e8m0()
     return GemmType, HummingLayer, get_heuristics_config
 
 
@@ -1013,12 +1087,34 @@ def _build_humming_weight_entry(
 ) -> HummingMxfp4W4A8Weight:
     GemmType, HummingLayer, get_heuristics_config = _import_humming()
 
-    if b_scale.dtype != torch.float32:
-        raise TypeError(
-            "Humming MXFP4 W4A8 path expects float32 weight scale, "
-            f"got {b_scale.dtype}"
+    # The MXFP4 W4A8 checkpoint stores per-32 weight scales as native E8M0
+    # exponents. Feed them as uint8/float8_e8m0fnu directly (no fp32/bf16 detour).
+    #
+    # IMPORTANT: Humming's *fused*-E8M0 path does NOT support per-token-group
+    # input scale (it only handles a single per-tensor global scale), which our
+    # DeepEP FP8 activations (per-token-group-128) require -> fused gives garbage.
+    # We force the *non-fused* group-scale mainloop path instead; it natively
+    # supports per-group input scale AND consumes the 1-byte E8M0 weight scale.
+    # The forcing is done purely on the SGLang side by _import_humming() ->
+    # _patch_humming_disable_fused_e8m0() (no Humming source edits); the env var
+    # SGLANG_HUMMING_DISABLE_FUSED_E8M0 (default "1") only gates that patch and is
+    # documented here via setdefault so it shows up for operators inspecting env.
+    os.environ.setdefault("SGLANG_HUMMING_DISABLE_FUSED_E8M0", "1")
+    e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if e8m0_dtype is None:
+        raise RuntimeError(
+            "Humming MXFP4 W4A8 path requires torch.float8_e8m0fnu support."
         )
-    if not b_packed.is_contiguous() or not b_scale.is_contiguous():
+    if b_scale.dtype == e8m0_dtype:
+        b_scale_e8m0 = b_scale.contiguous()
+    elif b_scale.dtype == torch.uint8:
+        b_scale_e8m0 = b_scale.contiguous().view(e8m0_dtype)
+    else:
+        raise TypeError(
+            "Humming MXFP4 W4A8 path expects E8M0 (uint8/float8_e8m0fnu) weight "
+            f"scale, got {b_scale.dtype}"
+        )
+    if not b_packed.is_contiguous():
         raise ValueError("Humming MXFP4 W4A8 path requires contiguous weight tensors.")
 
     num_experts = b_packed.shape[0]
@@ -1030,7 +1126,7 @@ def _build_humming_weight_entry(
             weight_config={
                 "dtype": "float4e2m1",
                 "group_size": 32,
-                "scale_dtype": "bfloat16",
+                "scale_dtype": "float8e8m0",
             },
             input_config={"dtype": "float8e4m3", "group_size": 128},
             torch_dtype=torch.bfloat16,
@@ -1043,11 +1139,19 @@ def _build_humming_weight_entry(
         b_packed.view(torch.int32), requires_grad=False
     )
     layer.weight_scale = torch.nn.Parameter(
-        b_scale.to(torch.bfloat16).contiguous(), requires_grad=False
+        b_scale_e8m0, requires_grad=False
     )
     layer.transform()
 
     meta = layer.humming_metas[""]
+    # Guard: the fused-E8M0 path silently miscomputes with per-group input scale
+    # (produces garbage tokens). Ensure the non-fused path was actually selected.
+    if getattr(meta, "use_fused_e8m0_scale", False):
+        raise RuntimeError(
+            "Humming MXFP4 W4A8 selected the fused-E8M0 path, which does not "
+            "support per-token-group input scale and will miscompute. Set "
+            "SGLANG_HUMMING_DISABLE_FUSED_E8M0=1 before server start."
+        )
     contig_compute_config = {
         "use_f16_accum": False,
         "gemm_type": GemmType.GROUPED_CONTIGUOUS.value,

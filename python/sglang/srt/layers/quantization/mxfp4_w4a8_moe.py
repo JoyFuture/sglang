@@ -62,6 +62,32 @@ class Mxfp4W4A8MoEMethod:
             **extra_weight_attrs,
         )
 
+        # The Fp8 MoE method creates the MXFP4 expert weight-scale params as
+        # float32, which forces the loader to decode the checkpoint's native
+        # uint8 E8M0 scales into fp32. The Humming W4A8 path consumes E8M0
+        # scales directly (its fused-E8M0 kernel asserts uint8/float8_e8m0fnu),
+        # so rebuild the scale params as float8_e8m0fnu here to keep the scales
+        # uint8 end-to-end. The loader's `_maybe_decode_mxfp4_scale` then stores
+        # the checkpoint bytes verbatim instead of decoding to fp32.
+        e8m0_dtype = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0_dtype is not None:
+            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                old = getattr(layer, scale_name, None)
+                if old is None or old.dtype == e8m0_dtype:
+                    continue
+                new_scale = torch.nn.Parameter(
+                    torch.ones(old.shape, dtype=e8m0_dtype, device=old.device),
+                    requires_grad=False,
+                )
+                # Preserve loader/quant attrs (weight_loader, quant_method, ...)
+                # attached by the Fp8 method via set_weight_attrs.
+                for attr, value in vars(old).items():
+                    if attr.startswith("_"):
+                        continue
+                    setattr(new_scale, attr, value)
+                delattr(layer, scale_name)
+                layer.register_parameter(scale_name, new_scale)
+
     def create_moe_runner(self, layer: Module, moe_runner_config) -> None:
         from sglang.srt.layers.moe.moe_runner import MoeRunner
 
