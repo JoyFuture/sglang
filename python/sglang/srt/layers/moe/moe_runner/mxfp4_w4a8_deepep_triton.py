@@ -1213,13 +1213,23 @@ def _build_humming_weight_entry(
     layer.transform()
 
     meta = layer.humming_metas[""]
-    # Guard: the fused-E8M0 path silently miscomputes with per-group input scale
-    # (produces garbage tokens). Ensure the non-fused path was actually selected.
-    if getattr(meta, "use_fused_e8m0_scale", False):
+    # The fused-E8M0 path historically does NOT support per-token-group input scale
+    # and silently miscomputes (garbage tokens). Stage 1 patches Humming's CUDA
+    # mainloop (mma/wgmma.cuh, arith/mainloop_arith.cuh, marked // SGLANG-STAGE1:)
+    # so fused ALSO applies per-group input scale. Enabling fused is therefore an
+    # explicit opt-in that REQUIRES that patched Humming:
+    #   * SGLANG_HUMMING_DISABLE_FUSED_E8M0=0  -> allow fused (monkeypatch keeps it)
+    #   * unset / =1 (default)                 -> force non-fused (Stage 0, no patch)
+    # Guard: if fused was selected but the operator did NOT opt in, it means the
+    # monkeypatch failed to suppress it -> would miscompute with unpatched Humming.
+    _fused_opt_in = os.environ.get("SGLANG_HUMMING_DISABLE_FUSED_E8M0", "1") == "0"
+    if getattr(meta, "use_fused_e8m0_scale", False) and not _fused_opt_in:
         raise RuntimeError(
-            "Humming MXFP4 W4A8 selected the fused-E8M0 path, which does not "
-            "support per-token-group input scale and will miscompute. Set "
-            "SGLANG_HUMMING_DISABLE_FUSED_E8M0=1 before server start."
+            "Humming MXFP4 W4A8 selected the fused-E8M0 path without opt-in. The "
+            "fused path needs the SGLANG-STAGE1 Humming CUDA patch for per-token-"
+            "group input scale; without it the output is garbage. Set "
+            "SGLANG_HUMMING_DISABLE_FUSED_E8M0=1 (force non-fused) or, only with the "
+            "patched Humming, =0 to opt into fused."
         )
     contig_compute_config = {
         "use_f16_accum": False,
