@@ -1069,25 +1069,36 @@ def _humming_prefill_tuning_overrides(
 # so every heuristic config for these MoE shapes must be bumped to warp-N 32.
 _HUMMING_E8M0_MIN_WARP_N = 32
 
-# Minimum num_ctas_per_sm for the non-fused E8M0 MoE GEMM path.
+# num_ctas_per_sm bounds for the E8M0 MoE GEMM path (performance fixes, both
+# measured on H20). Humming's grouped heuristic mis-sizes num_ctas_per_sm at the
+# two extremes of block_m:
 #
-# Separate from the warp-N correctness fix above: this is a *performance* fix.
-# Humming's grouped heuristic gives the smallest-M tile (block_m == 8, the
-# m[0,4) region) num_ctas_per_sm == 1. On the E8M0 path that tile runs ~1.6x
-# slower than with num_ctas_per_sm == 2 (0.040ms vs 0.024ms at M=64, measured),
-# because a single CTA/SM cannot hide the per-tile launch + scale-load overhead.
-# Bumping to 2 matches every other tile (which the heuristic already gives 2-3)
-# and costs nothing on those. SMEM stays within the 227KB budget at the block
-# shapes the heuristic emits for these MoE layers (verified: launch succeeds).
+#  * Smallest tile (block_m == 8, m[0,4) region) gets num_ctas_per_sm == 1. On the
+#    E8M0 path that runs ~1.6x slower than == 2 (0.040 vs 0.024ms at M=64),
+#    because a single CTA/SM cannot hide the per-tile launch + scale-load overhead.
+#    -> floor at 2.
+#  * Largest tile (block_m >= 64) gets num_ctas_per_sm == 3 on the fused path.
+#    A big tile's register/SMEM footprint makes 3 CTAs/SM over-subscribe and drop
+#    occupancy: fused block_m 64 runs 0.037ms at ctas 3 vs 0.025ms at ctas 2
+#    (1.48x, measured). The non-fused heuristic already gives 2 here, so capping
+#    at 2 is a no-op there and a fix for fused.
+#    -> cap at 2 once block_m >= _HUMMING_E8M0_LARGE_BLOCK_M.
+#
+# Both bounds converge to exactly 2 for the tiles they touch; the floor only
+# bites the smallest tile and the cap only the largest, so mid tiles (16/32/48,
+# heuristic ctas 2-3) are left as-is below the large-block threshold.
 _HUMMING_E8M0_MIN_CTAS_PER_SM = 2
+_HUMMING_E8M0_LARGE_BLOCK_M = 64
+_HUMMING_E8M0_LARGE_BLOCK_MAX_CTAS = 2
 
 
 def _sanitize_humming_e8m0_warp_n(tuning_config: Any) -> Any:
-    """Sanitize Humming heuristic configs for the non-fused E8M0 MoE GEMM path.
+    """Sanitize Humming heuristic configs for the E8M0 MoE GEMM path.
 
-    Two fixes, both required for this path:
-      * warp_shape[1] (warp-N) >= 32  -- correctness (warp-N 16 -> all-zero output)
-      * num_ctas_per_sm >= 2          -- performance (small-M tile otherwise ~1.6x slow)
+    Fixes:
+      * warp_shape[1] (warp-N) >= 32        -- correctness (warp-N 16 -> all-zero)
+      * num_ctas_per_sm >= 2                -- perf (smallest tile otherwise ~1.6x slow)
+      * num_ctas_per_sm <= 2 for block_m>=64 -- perf (fused large tile, ctas 3 -> 1.48x slow)
 
     Returns a new object; does not mutate the input. Handles both the dict
     (single config) and list ([m_start, m_end, cfg], ...) shapes that
@@ -1099,12 +1110,17 @@ def _sanitize_humming_e8m0_warp_n(tuning_config: Any) -> Any:
         if not warp_shape or len(warp_shape) != 3:
             return cfg
         warp_m, warp_n, warp_k = warp_shape
+        block_m = cfg.get("block_shape", (0,))[0]
         ctas = cfg.get("num_ctas_per_sm", 1)
-        if warp_n >= _HUMMING_E8M0_MIN_WARP_N and ctas >= _HUMMING_E8M0_MIN_CTAS_PER_SM:
+        new_warp_n = max(warp_n, _HUMMING_E8M0_MIN_WARP_N)
+        new_ctas = max(ctas, _HUMMING_E8M0_MIN_CTAS_PER_SM)
+        if block_m >= _HUMMING_E8M0_LARGE_BLOCK_M:
+            new_ctas = min(new_ctas, _HUMMING_E8M0_LARGE_BLOCK_MAX_CTAS)
+        if new_warp_n == warp_n and new_ctas == ctas:
             return cfg
         new_cfg = dict(cfg)
-        new_cfg["warp_shape"] = (warp_m, max(warp_n, _HUMMING_E8M0_MIN_WARP_N), warp_k)
-        new_cfg["num_ctas_per_sm"] = max(ctas, _HUMMING_E8M0_MIN_CTAS_PER_SM)
+        new_cfg["warp_shape"] = (warp_m, new_warp_n, warp_k)
+        new_cfg["num_ctas_per_sm"] = new_ctas
         return new_cfg
 
     if isinstance(tuning_config, dict):
