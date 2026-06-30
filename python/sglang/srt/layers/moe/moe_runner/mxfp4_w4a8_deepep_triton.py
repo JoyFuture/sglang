@@ -1055,6 +1055,75 @@ def _humming_prefill_tuning_overrides(
     return []
 
 
+# Minimum warp-N (warp_shape[1]) for the non-fused E8M0 MoE GEMM path.
+#
+# The non-fused group-weight-scale WGMMA mainloop indexes the weight-scale
+# fragment per warp tile (mainloop_arith.cuh: dq_bs[n*MmaShape::N/8 + inner_n]).
+# With an 8-bit (E8M0) weight scale and warp_shape[1] == 16 that index layout is
+# wrong and the kernel writes all-zero output (silent garbage, not a crash).
+# warp-N >= 32 computes correctly. The bf16-scale path tolerates warp-N == 16,
+# which is why this only bit us after switching the weight scale to E8M0.
+#
+# Humming's H20 heuristic (humming/tune/sm90_h20.py) emits warp-N == 16 for the
+# group_size>=128, shape_k>512 case (i.e. our per-token-group-128 activations),
+# so every heuristic config for these MoE shapes must be bumped to warp-N 32.
+_HUMMING_E8M0_MIN_WARP_N = 32
+
+# Minimum num_ctas_per_sm for the non-fused E8M0 MoE GEMM path.
+#
+# Separate from the warp-N correctness fix above: this is a *performance* fix.
+# Humming's grouped heuristic gives the smallest-M tile (block_m == 8, the
+# m[0,4) region) num_ctas_per_sm == 1. On the E8M0 path that tile runs ~1.6x
+# slower than with num_ctas_per_sm == 2 (0.040ms vs 0.024ms at M=64, measured),
+# because a single CTA/SM cannot hide the per-tile launch + scale-load overhead.
+# Bumping to 2 matches every other tile (which the heuristic already gives 2-3)
+# and costs nothing on those. SMEM stays within the 227KB budget at the block
+# shapes the heuristic emits for these MoE layers (verified: launch succeeds).
+_HUMMING_E8M0_MIN_CTAS_PER_SM = 2
+
+
+def _sanitize_humming_e8m0_warp_n(tuning_config: Any) -> Any:
+    """Sanitize Humming heuristic configs for the non-fused E8M0 MoE GEMM path.
+
+    Two fixes, both required for this path:
+      * warp_shape[1] (warp-N) >= 32  -- correctness (warp-N 16 -> all-zero output)
+      * num_ctas_per_sm >= 2          -- performance (small-M tile otherwise ~1.6x slow)
+
+    Returns a new object; does not mutate the input. Handles both the dict
+    (single config) and list ([m_start, m_end, cfg], ...) shapes that
+    ``get_heuristics_config`` can return.
+    """
+
+    def fix_cfg(cfg: dict) -> dict:
+        warp_shape = cfg.get("warp_shape")
+        if not warp_shape or len(warp_shape) != 3:
+            return cfg
+        warp_m, warp_n, warp_k = warp_shape
+        ctas = cfg.get("num_ctas_per_sm", 1)
+        if warp_n >= _HUMMING_E8M0_MIN_WARP_N and ctas >= _HUMMING_E8M0_MIN_CTAS_PER_SM:
+            return cfg
+        new_cfg = dict(cfg)
+        new_cfg["warp_shape"] = (warp_m, max(warp_n, _HUMMING_E8M0_MIN_WARP_N), warp_k)
+        new_cfg["num_ctas_per_sm"] = max(ctas, _HUMMING_E8M0_MIN_CTAS_PER_SM)
+        return new_cfg
+
+    if isinstance(tuning_config, dict):
+        return fix_cfg(tuning_config)
+    if isinstance(tuning_config, list):
+        sanitized: list[Any] = []
+        for entry in tuning_config:
+            if (
+                isinstance(entry, (list, tuple))
+                and len(entry) == 3
+                and isinstance(entry[2], dict)
+            ):
+                sanitized.append([entry[0], entry[1], fix_cfg(entry[2])])
+            else:
+                sanitized.append(entry)
+        return sanitized
+    return tuning_config
+
+
 def _apply_humming_prefill_tuning(
     tuning_config: Any,
     n: int,
@@ -1166,20 +1235,24 @@ def _build_humming_weight_entry(
         k=k,
         num_experts=num_experts,
         contig_compute_config=contig_compute_config,
-        contig_tuning_config=_apply_humming_prefill_tuning(
+        contig_tuning_config=_sanitize_humming_e8m0_warp_n(
+            _apply_humming_prefill_tuning(
+                get_heuristics_config(
+                    meta=meta,
+                    use_f16_accum=False,
+                    gemm_type=GemmType.GROUPED_CONTIGUOUS,
+                ),
+                n,
+                k,
+            )
+        ),
+        masked_compute_config=masked_compute_config,
+        masked_tuning_config=_sanitize_humming_e8m0_warp_n(
             get_heuristics_config(
                 meta=meta,
                 use_f16_accum=False,
-                gemm_type=GemmType.GROUPED_CONTIGUOUS,
-            ),
-            n,
-            k,
-        ),
-        masked_compute_config=masked_compute_config,
-        masked_tuning_config=get_heuristics_config(
-            meta=meta,
-            use_f16_accum=False,
-            gemm_type=GemmType.GROUPED_MASKED,
+                gemm_type=GemmType.GROUPED_MASKED,
+            )
         ),
     )
 
