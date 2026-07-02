@@ -11,7 +11,39 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.layers.moe.ep_moe.kernels import silu_and_mul_masked_post_quant_fwd
+from sglang.srt.layers.moe.ep_moe.kernels import (
+    silu_and_mul_masked_post_quant_fwd as _triton_silu_and_mul_masked_post_quant_fwd,
+)
+
+# The intermediate SiLU-and-mul + FP8 requant step between the two MoE GEMMs.
+# The Triton kernel (_triton_..._fwd) is the original; the DeepGEMM CUDA kernel
+# (sglang.jit_kernel.dsv4.silu_and_mul_masked_post_quant) is faster on the paths
+# we measured. Default to the CUDA kernel; set SGLANG_MXFP4_W4A8_DG_SILU=0 to fall
+# back to Triton. Both share the (input, output, output_scale, group_size,
+# masked_m) signature, so this is a drop-in swap.
+_USE_DG_SILU = os.environ.get("SGLANG_MXFP4_W4A8_DG_SILU", "1") != "0"
+
+
+def silu_and_mul_masked_post_quant_fwd(
+    input, output, output_scale, quant_group_size, masked_m
+):
+    if _USE_DG_SILU:
+        try:
+            from sglang.jit_kernel.dsv4 import silu_and_mul_masked_post_quant
+
+            silu_and_mul_masked_post_quant(
+                input, output, output_scale, quant_group_size, masked_m
+            )
+            return
+        except Exception as exc:  # fall back to Triton if the CUDA kernel is unavailable
+            _log_humming_warning_once(
+                "dg_silu_unavailable",
+                f"DeepGEMM silu_and_mul_masked_post_quant unavailable ({exc!r}); "
+                "falling back to the Triton kernel.",
+            )
+    _triton_silu_and_mul_masked_post_quant_fwd(
+        input, output, output_scale, quant_group_size, masked_m
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -1039,20 +1071,79 @@ def _humming_prefill_tuning_overrides(
     if not _USE_HUMMING_PREFILL_TUNING:
         return []
 
-    tuned_warp_n32_bm48 = {
-        "block_shape": (48, 128, 128),
-        "warp_shape": (48, 32, 128),
+    # Large-M (M >= 4096) prefill tile for the W13/W2 MoE GEMMs.
+    #
+    # C1 (2026-07, H20): the original override forced block_m=48/stages=3/ctas=2
+    # here, which is ~10-12% slower than block_m=64 at the real prefill sizes
+    # (M ~= 18176..19456). Measured (tests/probe_c1_tiles.py, CUDA-event steady
+    # state, M=19200, warp_n=32, stream_k):
+    #   block_m=48 s3 c2 (old): W13 2128us / W2 1180us  (baseline)
+    #   block_m=64 s4 c2 (new): W13 1900us / W2 1075us  (~1.11x faster, M-robust)
+    #   block_m=64 s{3,5} c2  : identical to s4 (stages count not sensitive here)
+    #   block_m=64 *  c3      : 3044us / 1566us  (0.70x -- ctas 3 over-subscribes
+    #                           the big tile; _sanitize_humming_e8m0_warp_n already
+    #                           caps ctas->2 for block_m>=64, which this relies on)
+    #   block_m=128           : >=2x slower (too few CTAs to fill 132 SMs)
+    # stages=4 chosen to match the humming heuristic's own large-M default (the
+    # sanitized heuristic path this reproduces). Small-M chunk buckets (M < 4096)
+    # are left to the heuristic and are unchanged by this override.
+    tuned_warp_n32_bm64 = {
+        "block_shape": (64, 128, 128),
+        "warp_shape": (64, 32, 128),
         "use_stream_k": True,
         "use_f16_accum": False,
         "num_sms": 132,
-        "num_stages": 3,
+        "num_stages": 4,
         "num_ctas_per_sm": 2,
     }
     if n == 4096 and k == 6144:
-        return [(4096, 1 << 30, tuned_warp_n32_bm48)]
+        return [(4096, 1 << 30, tuned_warp_n32_bm64)]
     if n == 6144 and k == 2048:
-        return [(4096, 1 << 30, tuned_warp_n32_bm48)]
+        return [(4096, 1 << 30, tuned_warp_n32_bm64)]
     return []
+
+
+def _humming_masked_tuning_override(
+    tuning_config: Any,
+    n: int,
+    k: int,
+) -> Any:
+    """Decode (masked) tuning override for the W13/W2 MoE GEMMs.
+
+    D1 (2026-07, H20): the masked path feeds Humming's per-M *list* heuristic as
+    the tuning_config. The launcher (launcher.cpp:84-87) selects the tile by
+    `valid_shape_m`, which for the masked launch defaults to the PADDED
+    shape_m = e*M_pad = 48*1024 = 49152, so it always lands on the [4096,inf)
+    bm64 bucket anyway. But passing the config as a *list* costs ~1.3x more than
+    passing the SAME tile as a single dict: the launcher re-scans/sets up the
+    per-M config list every call, and for the tiny decode kernel (~52us of real
+    work, sparse masked_m: typically 1 expert with <=256 tokens) that per-launch
+    overhead dominates.
+
+    Measured (tests/probe_decode_tile2.py, CUDA-event best-of-3, real sparse
+    masked_m, 1 expert):
+      list heuristic (default):  W13 68-70us / W2 71-74us  across em in {1,3,6}
+      single dict bm64/s4/c2:    W13 ~52us   / W2 ~52us     (~1.3-1.44x faster)
+      bm32/bm48/bm64 single dict: all ~51-53us (tile geometry barely matters;
+                                   the win is list->dict, not the tile)
+    The small-M list buckets (bm8) are actually WORSE for decode (106us at 256
+    tokens) because the real per-expert work fills a bm64 tile fine. We therefore
+    pin a single bm64 dict (same tile the list already selects, matches the C1
+    prefill tile) to shed the list-dispatch overhead. warp_n=32 preserved.
+    """
+    if not _USE_HUMMING_PREFILL_TUNING:
+        return tuning_config
+    if not ((n == 4096 and k == 6144) or (n == 6144 and k == 2048)):
+        return tuning_config
+    return {
+        "block_shape": (64, 128, 128),
+        "warp_shape": (64, 32, 128),
+        "use_stream_k": True,
+        "use_f16_accum": False,
+        "num_sms": 132,
+        "num_stages": 4,
+        "num_ctas_per_sm": 2,
+    }
 
 
 # Minimum warp-N (warp_shape[1]) for the non-fused E8M0 MoE GEMM path.
@@ -1274,10 +1365,14 @@ def _build_humming_weight_entry(
         ),
         masked_compute_config=masked_compute_config,
         masked_tuning_config=_sanitize_humming_e8m0_warp_n(
-            get_heuristics_config(
-                meta=meta,
-                use_f16_accum=False,
-                gemm_type=GemmType.GROUPED_MASKED,
+            _humming_masked_tuning_override(
+                get_heuristics_config(
+                    meta=meta,
+                    use_f16_accum=False,
+                    gemm_type=GemmType.GROUPED_MASKED,
+                ),
+                n,
+                k,
             )
         ),
     )
