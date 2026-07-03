@@ -1064,6 +1064,60 @@ def _import_humming():
     return GemmType, HummingLayer, get_heuristics_config
 
 
+# Device names that report sm_90 (Hopper) via the CUDA runtime and are the SAME
+# silicon as H20, but whose nvml product name does NOT contain "H20", so
+# Humming's get_heuristics_class() (which name-matches `"H20" in name`) misroutes
+# them to the generic Sm90Heuristics instead of Sm90H20Heuristics.
+#
+# The generic path emits large grouped tiles (block_m up to 176; warp_m == block_m
+# in the warp-spec mainloop). Those tiles (a) overflow ptxas registers at
+# num_ctas_per_sm>=2 -> compile fails at cuda-graph capture, and (b) even when
+# forced to compile, hang the grouped GEMM at runtime. Sm90H20Heuristics clamps
+# block_m to <=64 fixed buckets and is the config validated end-to-end on real
+# H20 (H20Z) with this exact serving command, so we pin these devices to it.
+#
+# Matched by substring like Humming's own H20 check. Extend this set if another
+# H20-silicon alias shows up.
+_HUMMING_H20_ALIAS_DEVICE_NAMES = ("L20X",)
+
+
+def _humming_should_force_h20_heuristics() -> bool:
+    """True when the current CUDA device is H20 silicon that Humming misroutes.
+
+    Guards on sm_90 AND a name that Humming would NOT already match as H20, so a
+    genuine full-fat H100/H200 (which wants the generic large tiles) is never
+    downgraded, and a real H20 (already routed correctly) is a no-op.
+    """
+    major, _ = torch.cuda.get_device_capability()
+    if major != 9:
+        return False
+    name = torch.cuda.get_device_name()
+    if "H20" in name and "H200" not in name:
+        return False  # Humming already routes real H20 correctly.
+    return any(alias in name for alias in _HUMMING_H20_ALIAS_DEVICE_NAMES)
+
+
+def _humming_heuristics_config(get_heuristics_config, *, meta, use_f16_accum, gemm_type):
+    """Wrap Humming's get_heuristics_config, forcing Sm90H20Heuristics on H20-alias
+    devices (e.g. L20X) that Humming's name-based router would otherwise send to the
+    crashing/hanging generic Sm90Heuristics path. Falls back to the stock router
+    (and stock behavior) on every other device."""
+    if _humming_should_force_h20_heuristics():
+        from humming.tune.sm90_h20 import Sm90H20Heuristics
+
+        return Sm90H20Heuristics.get_configs(
+            meta=meta,
+            use_f16_accum=use_f16_accum,
+            use_batch_invariant=False,
+            gemm_type=gemm_type,
+        )
+    return get_heuristics_config(
+        meta=meta,
+        use_f16_accum=use_f16_accum,
+        gemm_type=gemm_type,
+    )
+
+
 def _humming_prefill_tuning_overrides(
     n: int,
     k: int,
@@ -1354,7 +1408,8 @@ def _build_humming_weight_entry(
         contig_compute_config=contig_compute_config,
         contig_tuning_config=_sanitize_humming_e8m0_warp_n(
             _apply_humming_prefill_tuning(
-                get_heuristics_config(
+                _humming_heuristics_config(
+                    get_heuristics_config,
                     meta=meta,
                     use_f16_accum=False,
                     gemm_type=GemmType.GROUPED_CONTIGUOUS,
@@ -1366,7 +1421,8 @@ def _build_humming_weight_entry(
         masked_compute_config=masked_compute_config,
         masked_tuning_config=_sanitize_humming_e8m0_warp_n(
             _humming_masked_tuning_override(
-                get_heuristics_config(
+                _humming_heuristics_config(
+                    get_heuristics_config,
                     meta=meta,
                     use_f16_accum=False,
                     gemm_type=GemmType.GROUPED_MASKED,
